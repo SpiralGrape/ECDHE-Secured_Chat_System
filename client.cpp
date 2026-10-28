@@ -25,7 +25,7 @@ int main() {
         std::vector<unsigned char> shared_secret = CryptoUtils::derive_shared_secret(client_key, server_pub_key);
         std::vector<unsigned char> aes_key(shared_secret.begin(), shared_secret.begin() + 32);
 
-        std::cout << "✅ ECDHE 握手完成！通道已加密。\n";
+        std::cout << " ECDHE 握手完成！通道已加密。\n";
 
         // 4. 发送加密消息
         std::string msg = "这是一条测试消息，服务器你好！";

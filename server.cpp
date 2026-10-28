@@ -30,7 +30,7 @@ int main() {
             // 截取前32字节作为 AES Key
             std::vector<unsigned char> aes_key(shared_secret.begin(), shared_secret.begin() + 32);
 
-            std::cout << "✅ ECDHE 握手完成！准备接收加密消息...\n";
+            std::cout << " ECDHE 握手完成！准备接收加密消息...\n";
 
             // 4. 循环接收加密数据并解密
             for (;;) {
