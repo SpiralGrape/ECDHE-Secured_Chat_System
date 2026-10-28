@@ -1,0 +1,10 @@
+# Visual Studio 编译生成的文件
+x64/
+Debug/
+Release/
+.vs/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.user
