@@ -1,80 +1,190 @@
-# ECDHE-Secured Chat System (PFS-IM)
+# 基于 ECDHE 的前向保密聊天工具
 
-> **《专业课程设计》- 网络信息安全方向**
-> 题目：基于 ECDHE 的前向保密的聊天工具的实现
+> 《专业课程设计》— 网络信息安全方向  题目十九
 
-## 📖 项目简介
-本项目是一个基于 C++ 开发的端到端安全即时通讯系统。针对传统通信中长期密钥泄露导致历史数据被窃听的风险，本项目引入 **ECDHE (椭圆曲线迪菲-赫尔曼临时密钥交换)** 与 **AES-256-GCM** 算法，实现了具备**完美前向保密 (Perfect Forward Secrecy, PFS)** 特性的安全通信通道。
+一个用 C++17 实现的端到端加密（E2EE）聊天工具：**每次会话都用 X25519 临时密钥做 ECDHE 密钥交换**，派生独立的会话密钥，并用 AES-256-GCM 加密聊天内容。中继服务器不持有任何密钥，即使服务器被攻破也无法解密历史与实时消息。
 
-## ✨ 核心特性
-- **🔒 完美前向保密 (PFS)**：每次连接均使用 X25519 曲线动态生成临时会话密钥，即使长期主密钥泄露，历史聊天记录依然安全。
-- **🛡️ 端到端加密传输**：应用层数据全部采用 AES-256-GCM 算法进行加密，防止中间人窃听。
-- **✅ 数据完整性校验**：利用 GCM 模式的认证标签 (Tag) 机制，有效防止密文在传输过程中被篡改。
-- **⚡ 高性能异步 I/O**：基于 Boost.Asio 网络库构建，保障高并发下的数据传输效率。
-- **🧩 模块化设计**：网络层与密码学层解耦，具备良好的可扩展性。
+---
 
-## 🛠️ 技术栈
-- **开发语言**：C++17
-- **网络通信**：Boost.Asio (Socket 编程)
-- **密码学库**：OpenSSL 3.x (EVP API)
-- **开发环境**：Visual Studio 2022 / vcpkg 包管理器
+## 1. 安全设计
 
-## 🏗️ 核心架构与通信流程
-系统采用经典的 C/S (Client-Server) 架构，一次完整的加密通信握手流程如下：
-1. **Client** 启动，生成基于 X25519 的临时公私钥对，并将公钥发送给 Server。
-2. **Server** 接收公钥，同样生成临时公私钥对，将公钥回传给 Client。
-3. 双方利用各自的私钥和对端公钥，通过 ECDHE 算法计算出相同的共享密钥 (Shared Secret)。
-4. 双方使用 KDF 派生出 256 位的 AES 会话密钥。
-5. 后续聊天数据经 `IV + AES-GCM(明文) + Tag` 封装后，通过 TCP 进行安全传输。
+### 1.1 威胁模型
 
-## 🚀 编译与运行指南
+| 攻击者能力 | 系统响应 |
+|---|---|
+| 被动窃听链路（抓包） | 只能看到密文、帧长度和收发关系 |
+| 攻破中继服务器 | 服务器无密钥，无法解密；也无法篡改（会破坏 AEAD 认证） |
+| 主动中间人（MITM） | 握手时用 Ed25519 签名验证对端临时公钥，签名不符立即中止并告警 |
+| 重放/篡改/乱序 | 帧头（会话号 + 序号 + 收发方）作为 AAD 参与认证，序号严格单调 |
+| **日后长期主密钥泄露** | 会话密钥只由**临时**私钥派生，历史会话无法被还原（前向保密） |
 
-### 1. 环境依赖
-请确保你的电脑上已安装 `vcpkg`，并安装了以下依赖：
+### 1.2 握手流程（自研 TLS 1.3 风格）
+
+```mermaid
+sequenceDiagram
+    participant A as 客户端 A (发起方)
+    participant R as 中继服务器
+    participant B as 客户端 B (响应方)
+
+    A->>R: INIT  ver|sid|pubA|nonceA|idpubA|idA|idB|Sig_A
+    R->>B: 原样转发（无法解密/伪造）
+    B->>R: RESP  ver|sid|pubB|nonceB|idpubB|Sig_B|MAC_B
+    R->>A: 原样转发
+    A->>R: CONFIRM ver|sid|MAC_A
+    R->>B: 原样转发
+    Note over A,B: 会话建立，双向 AES-256-GCM 加密通信
+```
+
+- `pubA / pubB`：**本次会话新生成**的 X25519 临时公钥（32 字节）
+- `Sig_A / Sig_B`：Ed25519 **长期身份私钥**对握手报文的签名（只认证、不参与密钥派生）
+- `MAC_A / MAC_B`：用 `finished_key` 对握手 transcript 做 HMAC-SHA256，证明双方派生出相同会话密钥
+
+### 1.3 密钥调度
+
+```
+Z       = X25519(临时私钥, 对端临时公钥)                  // 每次会话都不同
+secret  = HKDF-SHA256(Z, salt = nonceA‖nonceB, "CHAT-v1 ECDHE X25519")
+chainI2R= HKDF(secret, "", "chain initiator->responder")   // 方向 1 的链密钥
+chainR2I= HKDF(secret, "", "chain responder->initiator")   // 方向 2 的链密钥
+finish  = HKDF(secret, "", "finished key")                // 握手确认用
+```
+
+**域分离**：收发两个方向使用不同链密钥，避免同一把密钥双向复用。
+
+### 1.4 消息级密钥棘轮
+
+每条消息发送前：
+
+```
+msg_key = HKDF(chain, "", "message key")
+nonce   = HKDF(chain, "", "message iv")
+chain'  = HKDF(chain, "", "chain next")     // 立即丢弃旧 chain
+```
+
+由此获得**消息级前向保密**：即使当前链密钥被攻破，也无法还原此前消息的密钥。
+
+### 1.5 三次“前向保密”论证（答辩要点）
+
+1. **握手临时化**：每次会话的 X25519 密钥对都用完即毁（`s.eph.reset()`），事后无从还原共享秘密；
+2. **身份密钥隔离**：长期 Ed25519 私钥只负责签名，从不参与密钥派生 → 主密钥泄露不影响历史会话；
+3. **链密钥推进**：消息密钥随棘轮前进并被覆盖，历史消息密钥不可恢复。
+
+---
+
+## 2. 帧格式
+
+TCP 上每条消息：
+
+```
+[ uint32 长度 ][ uint32 目标/来源 ID ][ 载荷 ]
+```
+
+载荷首字节为版本，第二字节为类型：
+
+| 类型 | 值 | 长度 | 说明 |
+|---|---|---|---|
+| `HS_INIT` | 0x01 | 162 | 握手请求 |
+| `HS_RESP` | 0x02 | 186 | 握手响应（含签名 + MAC_B） |
+| `HS_CONFIRM` | 0x03 | 42 | 握手确认（MAC_A） |
+| `DATA` | 0x10 | 18 + 密文 + 16 | `sid|seq|AES-256-GCM(明文, AAD)` |
+| `SYSTEM` | 0xFF | — | 服务器提示（如“用户不在线”），明文 |
+
+**AAD** = `ver|type|sid|seq|sender|target`（26 字节）——中继服务器无法在不解密的情况下篡改会话号、序号或收发方。
+
+---
+
+## 3. 目录结构
+
+```
+├── CMakeLists.txt
+├── Common/
+│   ├── crypto_utils.h      # OpenSSL 封装：X25519 / HKDF / AES-GCM / Ed25519
+│   └── protocol.h          # 协议常量、编解码、AAD 构造
+├── Server/
+│   └── server.cpp          # 不可信中继：按 ID 转发，不持密钥
+├── ClientGUI/
+│   └── ClientGUI.cpp       # Win32 GUI + 会话管理 + 握手/棘轮
+├── Tests/
+│   └── crypto_selftest.cpp # 密码学自测（19 项）
+└── Tools/
+    └── smoke_test.ps1      # 端到端自动化测试（服务器 + 两个客户端）
+```
+
+> 说明：`ClientGUI/ClientGUI.vcxproj`、`Server/Server.vcxproj` 与各自 `x64/` 目录是早期的 Visual Studio 手写工程，**已不再使用**，请统一用 CMake 构建，避免编译到旧代码。
+
+---
+
+## 4. 构建与运行
+
+依赖：Visual Studio 2022、CMake ≥ 3.20、vcpkg（`openssl`、`boost-asio`）。
+
 ```bash
-vcpkg install openssl:x64-windows
-vcpkg install boost-asio:x64-windows
+vcpkg install openssl:x64-windows boost-asio:x64-windows
+```
 
-2. 项目配置 (Visual Studio)
+用 VS Code 的 CMake Tools 直接构建，或：
 
-    使用 VS 2022 克隆本仓库。
+```bash
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Debug
+```
 
-    打开 Client 和 Server 的项目属性。
+运行：
 
-    在 C/C++ -> 常规 -> 附加包含目录 中添加：
-    你的vcpkg路径\installed\x64-windows\include
+1. 启动 `build/Debug/Server_App.exe`（监听 9000）；
+2. 启动两个 `build/Debug/ClientGUI_App.exe`；
+3. 双方窗口标题会显示自己分配到的 ID，在“收件人 ID”里填对方 ID，回车发送。
 
-    在 链接器 -> 常规 -> 附加库目录 中添加：
-    你的vcpkg路径\installed\x64-windows\lib
+聊天窗口会显示握手过程：
 
-    在 C/C++ -> 预处理器 中添加 _WIN32_WINNT=0x0A00。
+```
+--- [系统] 已连接服务器，你的 ID 是 1 ---
+--- [身份] 长期身份公钥指纹 3fa2c1d9... （仅用于签名临时密钥，泄露也不影响历史会话）---
+--- [握手] 已向用户2 发送 ECDHE 临时公钥 ---
+[+] 与用户2 的安全会话已建立，会话密钥指纹 8b1e07a4...
+```
 
-3. 运行测试
+身份密钥保存在 `%APPDATA%\ECDHE_Chat\identity.pem`，聊天记录保存在 `%APPDATA%\ECDHE_Chat\history.txt`（均为宽字符路径，支持中文用户名）。
 
-    右键 Server 项目，选择“设为启动项目”，按 F5 运行，等待监听 9000 端口。
+---
 
-    右键 Client 项目，选择“设为启动项目”，按 F5 运行。
+## 5. 验证
 
-    观察控制台输出 ✅ ECDHE 握手完成，即可开始加密通信。
+### 5.1 密码学自测（19 项）
 
-📂 项目结构
-text
+```bash
+build/Debug/CryptoTest.exe
+```
 
-├── Client/               # 客户端项目 (包含主函数与网络逻辑)
-├── Server/               # 服务端项目 (包含主函数与网络逻辑)
-├── Common/               # 公共模块
-│   └── crypto_utils.h    # OpenSSL 封装：密钥生成/交换/AES加解密
-├── .gitignore            # Git 忽略配置
-└── README.md             # 项目说明文档
+覆盖：Ed25519 签名与验签、PEM 持久化、X25519 一致性、**每次握手共享秘密不同**、HKDF 域分离、GCM 篡改检测（AAD/密文/密钥）、棘轮同步与历史密钥不可恢复。
 
-🔮 未来计划 (TODO)
+### 5.2 端到端自动化测试
 
-    □
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Tools\smoke_test.ps1
+```
 
-    接入 Windows GUI / Qt 框架，实现图形化聊天界面。
-    □
+脚本会启动 1 个服务器 + 2 个客户端，驱动界面互发消息，并校验双方都能解密显示。典型服务器日志：
 
-    增加双向身份认证机制，防范中间人攻击 (MITM)。
-    □
+```
+[中继] 1 -> 2 转发 162 字节（内容不可解密）   ← HS_INIT
+[中继] 2 -> 1 转发 186 字节（内容不可解密）   ← HS_RESP
+[中继] 1 -> 2 转发 42  字节（内容不可解密）   ← HS_CONFIRM
+[中继] 1 -> 2 转发 53  字节（内容不可解密）   ← 加密消息
+[中继] 2 -> 1 转发 51  字节（内容不可解密）   ← 加密消息
+```
 
-    引入密钥轮换机制 (Key Ratcheting)，实现消息级别的前向安全。
+### 5.3 前向保密演示
+
+1. 抓包可见两次连接的 32 字节公钥完全不同，密文完全不同；
+2. 删除 `identity.pem`（模拟“主密钥泄露”）后重启，历史密文依旧无法解密；
+3. 每次握手打印的“会话密钥指纹”互不相同。
+
+---
+
+## 6. 已知限制
+
+- 客户端 ID 由服务器按接入顺序分配，无登录体系；对端身份的信任采用**本次运行内 TOFU**（首次见面即固定指纹），生产环境应做持久化 + 指纹核对；
+- 一条 TCP 连接是单一有序流，若丢帧（如对端不在线）会导致棘轮失步，此时会话自动作废、需重新握手；
+- 聊天记录以明文保存在本地（不属于传输层威胁模型），如需本地加密可后续扩展；
+- 同一台机器上多个客户端共用同一 `identity.pem`（同一安装实例），部署到多机时天然独立。

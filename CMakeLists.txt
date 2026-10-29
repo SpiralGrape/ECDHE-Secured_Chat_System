@@ -1,29 +1,57 @@
-cmake_minimum_required(VERSION 3.10)
-project(ECDHE_Secured_Chat_System)
+cmake_minimum_required(VERSION 3.20)
+project(ECDHE_Secured_Chat_System LANGUAGES CXX)
 
-# ÉèÖÃ C++ ±ê×¼
+# ------------------------------------------------------------------ å…¨å±€é…ç½® --
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Ñ°ÕÒ OpenSSL ºÍ Boost
+add_compile_definitions(_WIN32_WINNT=0x0A00)
+
+if (MSVC)
+    # æºç ç»Ÿä¸€ä½¿ç”¨ UTF-8 ç¼–ç ï¼ˆæºç é›†çš„å­—ç¬¦ä¸²å­—é¢é‡ä¸º UTF-8ï¼‰
+    add_compile_options(/utf-8 /W3)
+endif()
+
+# ------------------------------------------------------------------ ä¾èµ– ------
 find_package(OpenSSL REQUIRED)
-find_package(Boost REQUIRED COMPONENTS system)
-# Éú³É·şÎñ¶Ë³ÌĞò
-add_executable(server server.cpp)
-target_link_libraries(server PRIVATE Boost::system OpenSSL::SSL OpenSSL::Crypto)
+# CMake 4.x å·²ç§»é™¤ FindBoost æ¨¡å—ï¼Œå¿…é¡»ä½¿ç”¨ Boost è‡ªå¸¦çš„ CONFIG æ¨¡å¼
+find_package(Boost CONFIG REQUIRED COMPONENTS system)
+find_package(Threads REQUIRED)
 
-# Éú³É¿Í»§¶Ë³ÌĞò
-add_executable(client client.cpp)
-target_link_libraries(client PRIVATE Boost::system OpenSSL::SSL OpenSSL::Crypto)
-# °üº¬Í·ÎÄ¼ş
-include_directories(${OPENSSL_INCLUDE_DIR} ${Boost_INCLUDE_DIRS})
-include_directories(${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+# ------------------------------------------------------------------ å…¬å…±å¤´æ–‡ä»¶ --
+set(COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Common)
 
-# Ìí¼ÓÄãµÄÔ´´úÂëÎÄ¼ş
-add_executable(ECDHE_Secured_Chat_System main.cpp)
-
-# Á´½Ó¿â
-target_link_libraries(ECDHE_Secured_Chat_System PRIVATE 
-    Boost::system 
-    OpenSSL::SSL 
-    OpenSSL::Crypto
+# ------------------------------------------------------------------ æœåŠ¡ç«¯ ----
+add_executable(Server_App
+    Server/server.cpp
 )
+target_include_directories(Server_App PRIVATE ${COMMON_DIR})
+target_link_libraries(Server_App PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Boost::system
+    Threads::Threads
+    ws2_32
+)
+
+# ------------------------------------------------------------------ å®¢æˆ·ç«¯ ----
+add_executable(ClientGUI_App WIN32
+    ClientGUI/ClientGUI.cpp
+)
+target_include_directories(ClientGUI_App PRIVATE ${COMMON_DIR})
+target_link_libraries(ClientGUI_App PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Boost::system
+    Threads::Threads
+    ws2_32
+    uxtheme
+    dwmapi
+)
+
+# ------------------------------------------------------------------ è‡ªæµ‹ ----
+add_executable(CryptoTest
+    Tests/crypto_selftest.cpp
+)
+target_include_directories(CryptoTest PRIVATE ${COMMON_DIR})
+target_link_libraries(CryptoTest PRIVATE OpenSSL::Crypto ws2_32)

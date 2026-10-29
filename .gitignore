@@ -8,3 +8,17 @@ Release/
 *.pdb
 *.ilk
 *.user
+
+# CMake / 构建输出
+build/
+out/
+CMakeCache.txt
+CMakeFiles/
+*.vcxproj.user
+
+# 编辑器本地配置（含本机 vcpkg 路径）
+.vscode/
+
+# 本机运行产物
+*.pem
+history.txt

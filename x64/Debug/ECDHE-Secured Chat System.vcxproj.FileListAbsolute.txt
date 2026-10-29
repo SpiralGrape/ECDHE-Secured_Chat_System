@@ -1,2 +1,0 @@
-C:\Users\陈浩然\code\ECDHE-Secured Chat System\x64\Debug\ECDHE-Secured Chat System.exe
-D:\ECDHE-Secured Chat System\x64\Debug\ECDHE-Secured Chat System.exe
