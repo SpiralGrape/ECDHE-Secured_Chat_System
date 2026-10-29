@@ -242,5 +242,3 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\mitm_demo.ps1
     ├── 专业程序设计报告-成员A-密码协议方向.docx
     └── 专业程序设计报告-成员B-网络与工程化方向.docx
 ```
-
-`ClientGUI/ClientGUI.vcxproj` 与 `Server/Server.vcxproj` 为早期手写工程，已不再使用，构建请统一走 CMake。
