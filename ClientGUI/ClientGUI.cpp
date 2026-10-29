@@ -7,24 +7,24 @@
 //   * Ed25519 身份签名 + Finished 校验，抵御中间人攻击
 //   * 消息级密钥棘轮（每条消息由链式 HKDF 派生新密钥，删除旧链密钥）
 //
-//  前向保密的实现要点：
-//   1. 每次握手都生成全新的临时 X25519 密钥对，用完立即销毁；
-//   2. 长期身份私钥只用于签名，不参与会话密钥派生；
-//   3. 每条消息的密钥由棘轮推进后立即覆盖，历史消息密钥不可再恢复。
-//   因此即使长期主密钥或当前会话密钥泄露，历史通信依然安全。
+//  体验相关：
+//   * 左侧会话列表，聊天记录按对端用户分文件持久化，重启自动重载
+//   * 握手/连接/错误等提示统一显示在底部状态栏，不污染聊天记录
+//   * 断线自动重连
 // ============================================================================
 
 #include <algorithm>
 #include <atomic>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,44 +47,75 @@
 using boost::asio::ip::tcp;
 using crypto::Bytes;
 
-// ============================================================== 全局状态 ====
-HWND  hChatBox = NULL, hInputBox = NULL, hTargetBox = NULL, hSendButton = NULL, hMainWnd = NULL;
-HBRUSH g_hDarkBrush = NULL;
-float  g_scale = 1.0f;
+// ============================================================== 常量/消息 ====
+#define WM_CHAT_EVENT   (WM_APP + 1)   // lParam = new ChatEvent
+#define WM_SET_STATUS   (WM_APP + 2)   // wParam = 是否错误, lParam = new std::wstring
+#define WM_LOAD_CHATS   (WM_APP + 3)   // wParam = 本地客户端 ID（加载该实例的聊天记录）
 
-#define WM_APPEND_CHAT (WM_APP + 1)
+#define IDC_SEND          1
+#define IDC_SESSION_LIST  101
+#define IDC_STATUS        102
+
+constexpr UINT_PTR IDT_RECONNECT = 1;
+
+// ============================================================== 全局状态 ====
+HWND  hChatBox = NULL, hInputBox = NULL, hTargetBox = NULL, hSendButton = NULL;
+HWND  hMainWnd = NULL, hSessionList = NULL, hStatus = NULL, hTargetLabel = NULL;
+HBRUSH g_hDarkBrush = NULL;
+HFONT  g_hFont = NULL, g_hStatusFont = NULL;
+float  g_scale = 1.0f;
+bool   g_statusError = false;
 
 // 网络
 std::shared_ptr<boost::asio::io_context> g_io;
 std::shared_ptr<tcp::socket>              g_sock;
-std::mutex                                g_net_mu;        // 保护 g_sock 与发送
+std::mutex                                g_net_mu;
 std::atomic<bool>                         g_connected(false);
+std::atomic<bool>                         g_connecting(false);
 int                                       my_client_id = 0;
 
 // 身份（长期主密钥）
 crypto::PkeyPtr g_identity;
 std::wstring    g_my_fingerprint;
 
-// 会话表
+// 会话（跨线程访问，用 g_sess_mu 保护）
 struct Session {
     enum class State { None, Initiator, Responder, Established };
 
     State          state = State::None;
     uint64_t       sid = 0;
-    crypto::PkeyPtr eph;                    // 临时私钥（派生后立即销毁）
+    crypto::PkeyPtr eph;
     Bytes          my_pub, my_nonce, my_idpub;
     Bytes          peer_pub, peer_nonce, peer_idpub;
-    Bytes          init_msg, resp_msg;      // 握手报文（用于计算 transcript）
-    Bytes          send_chain, recv_chain;  // 密钥棘轮链密钥
+    Bytes          init_msg, resp_msg;
+    Bytes          send_chain, recv_chain;
     Bytes          finished_key;
     uint64_t       send_seq = 0, recv_seq = 0;
-    std::wstring   fingerprint;             // 会话密钥指纹（演示用）
-    std::deque<std::string> outbox;         // 握手完成前排队的消息
+    std::wstring   fingerprint;
+    std::deque<std::string> outbox;         // 握手完成前排队等待发送的消息
 };
 
 std::map<int, Session> g_sessions;
-std::map<int, Bytes>   g_pins;              // TOFU：对端身份公钥
+std::map<int, Bytes>   g_pins;              // TOFU 指纹固定
 std::mutex             g_sess_mu;
+
+// 聊天记录（只在 UI 线程访问）
+struct ChatMsg {
+    uint64_t     ts = 0;    // unix 秒
+    int          dir = 0;   // 0=收到 1=发出
+    std::wstring text;
+};
+std::map<int, std::vector<ChatMsg>> g_chats;
+std::set<int>  g_unread;
+int            g_activePeer = 0;            // 0 表示无选中会话
+int            g_profileId  = 0;            // 聊天记录所属的本地实例（= 服务器分配的 ID）
+
+// 网络线程 → UI 线程的消息
+struct ChatEvent {
+    int          peer;
+    int          dir;    // 0=收到 1=发出 2=系统提示
+    std::wstring text;
+};
 
 // ============================================================== 工具函数 ====
 static std::wstring Utf8ToWide(const std::string& s) {
@@ -123,20 +154,203 @@ static std::wstring AppDir() {
     return dir;
 }
 
-static void SaveToLocalFile(const std::wstring& text) {
-    std::filesystem::path p = std::filesystem::path(AppDir()) / L"history.txt";
+static std::wstring ChatsDir(int profileId) {
+    std::wstring dir = AppDir() + L"\\chats";
+    if (profileId > 0) dir += L"\\" + std::to_wstring(profileId);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+static std::wstring FormatTime(uint64_t ts) {
+    time_t t = (time_t)ts;
+    tm local {};
+    localtime_s(&local, &t);
+    wchar_t b[16];
+    swprintf_s(b, L"%02d:%02d", local.tm_hour, local.tm_min);
+    return b;
+}
+
+// 文本转义：让每条消息在文件中严格占一行
+static std::wstring Esc(const std::wstring& s) {
+    std::wstring o;
+    o.reserve(s.size());
+    for (wchar_t c : s) {
+        if (c == L'\\')      o += L"\\\\";
+        else if (c == L'\n') o += L"\\n";
+        else if (c == L'\r') continue;
+        else if (c == L'\t') o += L"\\t";
+        else                 o += c;
+    }
+    return o;
+}
+
+static std::wstring Unesc(const std::wstring& s) {
+    std::wstring o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == L'\\' && i + 1 < s.size()) {
+            wchar_t n = s[++i];
+            if (n == L'n')      o += L'\n';
+            else if (n == L't') o += L'\t';
+            else                o += n;
+        } else {
+            o += s[i];
+        }
+    }
+    return o;
+}
+
+// ============================================================ 聊天记录 IO ====
+static std::wstring ChatFile(int peer) {
+    return ChatsDir(g_profileId) + L"\\" + std::to_wstring(peer) + L".log";
+}
+
+static void SaveChatMsg(int peer, const ChatMsg& m) {
     FILE* f = nullptr;
-    if (_wfopen_s(&f, p.c_str(), L"ab") == 0 && f) {   // 宽字符路径，支持中文用户名
-        std::string u8 = WideToUtf8(text);
-        fwrite(u8.data(), 1, u8.size(), f);
+    if (_wfopen_s(&f, ChatFile(peer).c_str(), L"ab") != 0 || !f) return;
+
+    wchar_t head[64];
+    swprintf_s(head, L"%llu\t%d\t", (unsigned long long)m.ts, m.dir);
+    std::string line = WideToUtf8(std::wstring(head) + Esc(m.text) + L"\n");
+    fwrite(line.data(), 1, line.size(), f);
+    fclose(f);
+}
+
+static void LoadAllChats(int profileId) {
+    g_chats.clear();
+    g_unread.clear();
+    g_activePeer = 0;
+    g_profileId  = profileId;
+
+    std::error_code ec;
+    std::filesystem::path dir(ChatsDir(profileId));
+    if (!std::filesystem::exists(dir, ec)) return;
+
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) continue;
+        std::wstring name = entry.path().stem().wstring();
+        if (entry.path().extension() != L".log") continue;
+
+        int peer = _wtoi(name.c_str());
+        if (peer <= 0) continue;
+
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, entry.path().c_str(), L"rb") != 0 || !f) continue;
+        std::string raw;
+        char buf[4096];
+        size_t n = 0;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) raw.append(buf, n);
         fclose(f);
+
+        std::wstring all = Utf8ToWide(raw);
+        size_t pos = 0;
+        while (pos < all.size()) {
+            size_t eol = all.find(L'\n', pos);
+            if (eol == std::wstring::npos) eol = all.size();
+            std::wstring line = all.substr(pos, eol - pos);
+            pos = eol + 1;
+            if (line.empty()) continue;
+
+            size_t t1 = line.find(L'\t');
+            if (t1 == std::wstring::npos) continue;
+            size_t t2 = line.find(L'\t', t1 + 1);
+            if (t2 == std::wstring::npos) continue;
+
+            ChatMsg m;
+            m.ts  = _wcstoui64(line.substr(0, t1).c_str(), nullptr, 10);
+            m.dir = _wtoi(line.substr(t1 + 1, t2 - t1 - 1).c_str());
+            m.text = Unesc(line.substr(t2 + 1));
+            g_chats[peer].push_back(m);
+        }
     }
 }
 
-// 向界面投递文本（线程安全）
-static void UiPost(const std::wstring& s) {
+// ============================================================== UI 辅助 ====
+static void RefreshSessionList() {
+    if (!hSessionList) return;
+    SendMessageW(hSessionList, LB_RESETCONTENT, 0, 0);
+
+    for (const auto& kv : g_chats) {
+        const int peer = kv.first;
+        std::wstring label = L"用户 " + std::to_wstring(peer);
+        if (g_unread.count(peer)) label += L"  ●";
+        int idx = (int)SendMessageW(hSessionList, LB_ADDSTRING, 0, (LPARAM)label.c_str());
+        if (idx >= 0) SendMessageW(hSessionList, LB_SETITEMDATA, idx, (LPARAM)peer);
+    }
+
+    // 保持当前选中项
+    if (g_activePeer > 0) {
+        int count = (int)SendMessageW(hSessionList, LB_GETCOUNT, 0, 0);
+        for (int i = 0; i < count; ++i) {
+            if (SendMessageW(hSessionList, LB_GETITEMDATA, i, 0) == (LPARAM)g_activePeer) {
+                SendMessageW(hSessionList, LB_SETCURSEL, i, 0);
+                break;
+            }
+        }
+    }
+}
+
+static std::wstring RenderLine(int peer, const ChatMsg& m) {
+    std::wstring line = L"[" + FormatTime(m.ts) + L"] ";
+    if (m.dir == 0)      line += L"用户 " + std::to_wstring(peer) + L": ";
+    else if (m.dir == 1) line += L"我: ";
+    else                 line += L"⚠ ";
+    line += m.text + L"\r\n";
+    return line;
+}
+
+static void RefreshChatView() {
+    if (!hChatBox) return;
+
+    std::wstring all;
+    auto it = g_chats.find(g_activePeer);
+    if (it != g_chats.end()) {
+        for (const auto& m : it->second) all += RenderLine(g_activePeer, m);
+    }
+    SetWindowTextW(hChatBox, all.c_str());
+    SendMessageW(hChatBox, EM_SETSEL, (WPARAM)all.size(), (LPARAM)all.size());
+    SendMessageW(hChatBox, WM_VSCROLL, SB_BOTTOM, 0);
+}
+
+// 在聊天视图尾部追加一行（仅当属于当前会话）
+static void AppendChatView(const std::wstring& line) {
+    int len = GetWindowTextLengthW(hChatBox);
+    SendMessageW(hChatBox, EM_SETSEL, len, len);
+    SendMessageW(hChatBox, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+    SendMessageW(hChatBox, WM_VSCROLL, SB_BOTTOM, 0);
+}
+
+static void ApplyChatEvent(int peer, int dir, const std::wstring& text) {
+    if (peer <= 0) return;
+
+    ChatMsg m;
+    m.ts   = (uint64_t)time(nullptr);
+    m.dir  = dir;
+    m.text = text;
+
+    g_chats[peer].push_back(m);
+    SaveChatMsg(peer, m);
+
+    if (peer == g_activePeer) {
+        AppendChatView(RenderLine(peer, m));
+    } else if (dir == 0) {
+        g_unread.insert(peer);
+    }
+
+    int listCount = (int)SendMessageW(hSessionList, LB_GETCOUNT, 0, 0);
+    if (dir == 1 || (int)g_chats.size() != listCount) RefreshSessionList();
+}
+
+// 线程安全地投递界面事件
+static void PostChat(int peer, int dir, const std::wstring& text) {
     if (!hMainWnd) return;
-    PostMessageW(hMainWnd, WM_APPEND_CHAT, 0, (LPARAM)new std::wstring(s));
+    PostMessageW(hMainWnd, WM_CHAT_EVENT, 0, (LPARAM)new ChatEvent{ peer, dir, text });
+}
+
+static void PostStatus(const std::wstring& text, bool error = false) {
+    if (!hMainWnd) return;
+    PostMessageW(hMainWnd, WM_SET_STATUS, (WPARAM)(error ? 1 : 0), (LPARAM)new std::wstring(text));
 }
 
 // ============================================================ 链路收发 ====
@@ -158,12 +372,11 @@ static bool SendRaw(const Bytes& frame) {
 }
 
 // ============================================================ 密钥派生 ====
-// 由 ECDHE 共享秘密派生会话密钥。派生完成后立刻销毁临时私钥。
 static void DeriveSession(Session& s, bool initiator) {
     crypto::PkeyPtr peer = crypto::x25519_from_public_raw(s.peer_pub.data(), s.peer_pub.size());
     Bytes z = crypto::x25519_shared(s.eph.get(), peer.get());
 
-    // salt 固定为 nonceA || nonceB（A = 发起方），把双方随机数绑进密钥
+    // salt 固定为 nonceA || nonceB（A = 发起方）
     Bytes salt = initiator ? crypto::cat(s.my_nonce, s.peer_nonce)
                            : crypto::cat(s.peer_nonce, s.my_nonce);
 
@@ -183,7 +396,7 @@ static void DeriveSession(Session& s, bool initiator) {
     crypto::wipe(c_i2r);
     crypto::wipe(c_r2i);
 
-    // ★ 前向保密关键：临时私钥用完即毁，事后无法再复现共享秘密
+    // 前向保密关键：临时私钥用完即毁
     s.eph.reset();
 }
 
@@ -193,7 +406,6 @@ static Bytes TranscriptHash(const Bytes& a, const Bytes& b) {
 
 // ======================================================= 会话（需持锁） ====
 static void LockedSendChat(int peer, Session& s, const std::string& text) {
-    // 密钥棘轮：每条消息用链密钥派生新密钥，然后立刻推进链密钥
     Bytes msg_key = crypto::hkdf(s.send_chain, Bytes{}, "message key", 32);
     Bytes nonce   = crypto::hkdf(s.send_chain, Bytes{}, "message iv", 12);
     Bytes next    = crypto::hkdf(s.send_chain, Bytes{}, "chain next", 32);
@@ -232,7 +444,6 @@ static void LockedFlushOutbox(int peer, Session& s) {
     }
 }
 
-// 发起握手（需持 g_sess_mu）
 static void LockedStartHandshake(int peer) {
     Session& s = g_sessions[peer];
     std::deque<std::string> saved;
@@ -249,8 +460,8 @@ static void LockedStartHandshake(int peer) {
         s.my_nonce = crypto::random_bytes(proto::NONCE_LEN);
         s.my_idpub = crypto::ed25519_public_raw(g_identity.get());
     } catch (...) {
-        UiPost(L"[X] 生成本次会话临时密钥失败\r\n");
         s.state = Session::State::None;
+        PostStatus(L"生成会话临时密钥失败", true);
         return;
     }
 
@@ -264,25 +475,24 @@ static void LockedStartHandshake(int peer) {
     proto::append_u32(msg, (uint32_t)my_client_id);
     proto::append_u32(msg, (uint32_t)peer);
 
-    Bytes sig = crypto::ed25519_sign(g_identity.get(), msg);   // 长期主密钥签名临时公钥
+    Bytes sig = crypto::ed25519_sign(g_identity.get(), msg);
 
     Bytes payload = msg;
     proto::append(payload, sig);
     s.init_msg = payload;
 
     SendRaw(MakeFrame(peer, payload));
-    UiPost(L"--- [握手] 已向用户" + std::to_wstring(peer) + L" 发送 ECDHE 临时公钥 ---\r\n");
+    PostStatus(L"正在与用户 " + std::to_wstring(peer) + L" 协商 ECDHE 会话…");
 }
 
 static bool CheckPin(int peer, const Bytes& idpub) {
     auto it = g_pins.find(peer);
     if (it == g_pins.end()) {
         g_pins[peer] = idpub;
-        UiPost(L"--- [身份] 已固定用户" + std::to_wstring(peer) + L" 的身份公钥 " + HexW(crypto::sha256(idpub), 8) + L" ---\r\n");
         return true;
     }
     if (it->second != idpub) {
-        UiPost(L"[!] 警告：用户" + std::to_wstring(peer) + L" 的身份公钥发生变化，可能遭遇中间人攻击！\r\n");
+        PostChat(peer, 2, L"对端身份公钥发生变化，可能存在中间人攻击，已中止");
         return false;
     }
     return true;
@@ -295,22 +505,21 @@ static void HandleConfirm(int sender, const Bytes& body);
 static void HandleData(int sender, const Bytes& body);
 static void HandleSystem(const Bytes& body);
 
-// ------------------------------------------------------------ 收到 INIT ---
 static void HandleInit(int sender, const Bytes& body) {
     if (body.size() != proto::HS_INIT_LEN) return;
 
-    const uint64_t sid     = proto::get_u64(body.data() + 2);
-    Bytes pubA             = proto::slice(body, 10, proto::X25519_LEN);
-    Bytes nonceA           = proto::slice(body, 42, proto::NONCE_LEN);
-    Bytes idpubA           = proto::slice(body, 58, proto::ED25519_LEN);
-    const uint32_t idA     = proto::get_u32(body.data() + 90);
-    const uint32_t idB     = proto::get_u32(body.data() + 94);
-    Bytes sigA             = proto::slice(body, 98, proto::SIG_LEN);
+    const uint64_t sid = proto::get_u64(body.data() + 2);
+    Bytes pubA         = proto::slice(body, 10, proto::X25519_LEN);
+    Bytes nonceA       = proto::slice(body, 42, proto::NONCE_LEN);
+    Bytes idpubA       = proto::slice(body, 58, proto::ED25519_LEN);
+    const uint32_t idA = proto::get_u32(body.data() + 90);
+    const uint32_t idB = proto::get_u32(body.data() + 94);
+    Bytes sigA         = proto::slice(body, 98, proto::SIG_LEN);
 
-    if ((int)idA != sender || (int)idB != my_client_id) return;   // 报文被改投
+    if ((int)idA != sender || (int)idB != my_client_id) return;
 
     if (!crypto::ed25519_verify(idpubA, proto::slice(body, 0, proto::HS_INIT_BASE), sigA)) {
-        UiPost(L"[!] 用户" + std::to_wstring(sender) + L" 的握手签名无效，已丢弃（可能是中间人）\r\n");
+        PostChat(sender, 2, L"对端握手签名无效，已丢弃（可能是中间人）");
         return;
     }
 
@@ -325,7 +534,6 @@ static void HandleInit(int sender, const Bytes& body) {
     }
     if (!CheckPin(sender, idpubA)) return;
 
-    // 允许重新协商：用新的握手覆盖旧会话（例如上一次会话因丢包失步）
     Session& s = g_sessions[sender];
     std::deque<std::string> saved;
     saved.swap(s.outbox);
@@ -351,12 +559,12 @@ static void HandleInit(int sender, const Bytes& body) {
         proto::append_u64(resp, s.sid);
         proto::append(resp, s.my_pub);
         proto::append(resp, s.my_nonce);
-        proto::append(resp, s.my_idpub);            // 前 90 字节
+        proto::append(resp, s.my_idpub);
 
         Bytes to_sign = resp;
-        proto::append(to_sign, sigA);               // 绑定到对方的 INIT
+        proto::append(to_sign, sigA);
         Bytes sigB = crypto::ed25519_sign(g_identity.get(), to_sign);
-        proto::append(resp, sigB);                  // 前 154 字节
+        proto::append(resp, sigB);
 
         DeriveSession(s, /*initiator=*/false);
 
@@ -365,19 +573,18 @@ static void HandleInit(int sender, const Bytes& body) {
         mac_input.push_back('B');
         Bytes macB = crypto::hmac_sha256(s.finished_key, mac_input);
 
-        s.resp_msg = resp;                          // 保存不含 mac 的副本
+        s.resp_msg = resp;
         Bytes payload = resp;
         proto::append(payload, macB);
 
         SendRaw(MakeFrame(sender, payload));
-        UiPost(L"--- [握手] 已响应用户" + std::to_wstring(sender) + L"，会话密钥指纹 " + s.fingerprint + L" ---\r\n");
+        PostStatus(L"正在与用户 " + std::to_wstring(sender) + L" 协商 ECDHE 会话…");
     } catch (...) {
         s.state = Session::State::None;
-        UiPost(L"[X] 处理握手请求时出错\r\n");
+        PostStatus(L"处理握手请求时出错", true);
     }
 }
 
-// ------------------------------------------------------------ 收到 RESP ---
 static void HandleResp(int sender, const Bytes& body) {
     if (body.size() != proto::HS_RESP_LEN) return;
 
@@ -393,14 +600,14 @@ static void HandleResp(int sender, const Bytes& body) {
     auto it = g_sessions.find(sender);
     if (it == g_sessions.end() || it->second.state != Session::State::Initiator) return;
     Session& s = it->second;
-    if (s.sid != sid || s.init_msg.size() != proto::HS_INIT_LEN) return;   // 陈旧响应
+    if (s.sid != sid || s.init_msg.size() != proto::HS_INIT_LEN) return;
 
     Bytes sigA = proto::slice(s.init_msg, proto::HS_INIT_BASE, proto::SIG_LEN);
     // 签名覆盖：RESP 前 90 字节 + 对方 INIT 的签名（不含 sigB 自身）
     Bytes to_sign = proto::slice(body, 0, proto::HS_RESP_BASE);
     proto::append(to_sign, sigA);
     if (!crypto::ed25519_verify(idpubB, to_sign, sigB)) {
-        UiPost(L"[!] 用户" + std::to_wstring(sender) + L" 的握手响应签名无效，已中止\r\n");
+        PostChat(sender, 2, L"对端握手响应签名无效，会话已中止");
         g_sessions.erase(it);
         return;
     }
@@ -414,7 +621,7 @@ static void HandleResp(int sender, const Bytes& body) {
         DeriveSession(s, /*initiator=*/true);
     } catch (...) {
         g_sessions.erase(it);
-        UiPost(L"[X] 会话密钥派生失败\r\n");
+        PostStatus(L"会话密钥派生失败", true);
         return;
     }
 
@@ -423,12 +630,11 @@ static void HandleResp(int sender, const Bytes& body) {
     mac_input.push_back('B');
     Bytes expect = crypto::hmac_sha256(s.finished_key, mac_input);
     if (expect != macB) {
-        UiPost(L"[!] 会话密钥确认失败，握手中止（可能被中间人篡改）\r\n");
+        PostChat(sender, 2, L"会话密钥确认失败，握手已中止");
         g_sessions.erase(it);
         return;
     }
 
-    // 发送 CONFIRM
     Bytes mac_input_a = th;
     mac_input_a.push_back('A');
     Bytes macA = crypto::hmac_sha256(s.finished_key, mac_input_a);
@@ -442,11 +648,10 @@ static void HandleResp(int sender, const Bytes& body) {
 
     s.state = Session::State::Established;
     s.resp_msg = resp_core;
-    UiPost(L"[+] 与用户" + std::to_wstring(sender) + L" 的安全会话已建立，会话密钥指纹 " + s.fingerprint + L"\r\n");
+    PostStatus(L"与用户 " + std::to_wstring(sender) + L" 的安全会话已建立 · 密钥指纹 " + s.fingerprint);
     LockedFlushOutbox(sender, s);
 }
 
-// --------------------------------------------------------- 收到 CONFIRM ---
 static void HandleConfirm(int sender, const Bytes& body) {
     if (body.size() != proto::HS_CONFIRM_LEN) return;
     const uint64_t sid = proto::get_u64(body.data() + 2);
@@ -463,17 +668,16 @@ static void HandleConfirm(int sender, const Bytes& body) {
     mac_input.push_back('A');
     Bytes expect = crypto::hmac_sha256(s.finished_key, mac_input);
     if (expect != macA) {
-        UiPost(L"[!] 用户" + std::to_wstring(sender) + L" 的握手确认无效，会话未建立\r\n");
+        PostChat(sender, 2, L"对端握手确认无效，会话未建立");
         g_sessions.erase(it);
         return;
     }
 
     s.state = Session::State::Established;
-    UiPost(L"[+] 与用户" + std::to_wstring(sender) + L" 的安全会话已建立，会话密钥指纹 " + s.fingerprint + L"\r\n");
+    PostStatus(L"与用户 " + std::to_wstring(sender) + L" 的安全会话已建立 · 密钥指纹 " + s.fingerprint);
     LockedFlushOutbox(sender, s);
 }
 
-// ------------------------------------------------------------ 收到 DATA ---
 static void HandleData(int sender, const Bytes& body) {
     if (body.size() < proto::DATA_MIN) return;
     const uint64_t sid = proto::get_u64(body.data() + 2);
@@ -482,13 +686,10 @@ static void HandleData(int sender, const Bytes& body) {
 
     std::lock_guard<std::mutex> lk(g_sess_mu);
     auto it = g_sessions.find(sender);
-    if (it == g_sessions.end() || it->second.state != Session::State::Established) {
-        UiPost(L"[!] 收到用户" + std::to_wstring(sender) + L" 的消息，但本地没有可用会话，已丢弃\r\n");
-        return;
-    }
+    if (it == g_sessions.end() || it->second.state != Session::State::Established) return;
     Session& s = it->second;
     if (s.sid != sid || seq != s.recv_seq) {
-        UiPost(L"[!] 用户" + std::to_wstring(sender) + L" 的会话失步或重放，会话已重置\r\n");
+        PostChat(sender, 2, L"会话状态失步或检测到重放，已重置会话");
         g_sessions.erase(it);
         return;
     }
@@ -506,7 +707,7 @@ static void HandleData(int sender, const Bytes& body) {
 
     if (!ok) {
         crypto::wipe(next);
-        UiPost(L"[!] 用户" + std::to_wstring(sender) + L" 的消息认证失败（被篡改或密钥不匹配），会话已重置\r\n");
+        PostChat(sender, 2, L"消息认证失败（被篡改或密钥不匹配），已重置会话");
         g_sessions.erase(it);
         return;
     }
@@ -516,26 +717,33 @@ static void HandleData(int sender, const Bytes& body) {
     crypto::wipe(next);
     s.recv_seq++;
 
-    std::wstring text = L"用户" + std::to_wstring(sender) + L": " + Utf8ToWide(plain) + L"\r\n";
-    SaveToLocalFile(text);
-    UiPost(text);
+    PostChat(sender, 0, Utf8ToWide(plain));
 }
 
-// ---------------------------------------------------------- 收到系统消息 ---
 static void HandleSystem(const Bytes& body) {
     // [ver][SYSTEM][related_id(4)][文本]
     if (body.size() < 6) return;
     int related = (int)proto::get_u32(body.data() + 2);
-    std::string text(body.begin() + 6, body.end());
+    std::wstring text = Utf8ToWide(std::string(body.begin() + 6, body.end()));
 
-    UiPost(L"[系统] " + Utf8ToWide(text) + L"\r\n");
-
-    // 目标不在线：丢弃挂起的会话，避免棘轮状态与对端不一致
     std::lock_guard<std::mutex> lk(g_sess_mu);
     auto it = g_sessions.find(related);
-    if (it != g_sessions.end() && it->second.state != Session::State::Established) {
+    if (it != g_sessions.end()) {
+        size_t pending = it->second.outbox.size();
+        bool established = (it->second.state == Session::State::Established);
         g_sessions.erase(it);
+
+        if (pending > 0) {
+            PostChat(related, 2, text + L"，" + std::to_wstring(pending) + L" 条消息未送达");
+        } else if (established) {
+            PostChat(related, 2, text + L"，会话已断开，下次发送将重新协商");
+        } else {
+            PostChat(related, 2, text);
+        }
+    } else {
+        PostChat(related, 2, text);
     }
+    PostStatus(text, true);
 }
 
 // ============================================================ 网络线程 ====
@@ -550,11 +758,6 @@ static void NetworkThread() {
         boost::asio::read(*sock, boost::asio::buffer(&id, 4), ec);
         if (ec) throw std::runtime_error("读取客户端 ID 失败");
         my_client_id = (int)id;
-        // 标题带上自己的 ID，便于多开时区分窗口
-        {
-            std::wstring title = L"ECDHE 前向保密聊天工具 - 用户 " + std::to_wstring(my_client_id);
-            SetWindowTextW(hMainWnd, title.c_str());
-        }
 
         {
             std::lock_guard<std::mutex> lk(g_net_mu);
@@ -562,9 +765,10 @@ static void NetworkThread() {
             g_connected.store(true);
         }
 
-        UiPost(L"--- [系统] 已连接服务器，你的 ID 是 " + std::to_wstring(my_client_id) + L" ---\r\n");
-        UiPost(L"--- [身份] 长期身份公钥指纹 " + g_my_fingerprint +
-               L"（仅用于签名临时密钥，泄露也不影响历史会话）---\r\n");
+        std::wstring title = L"ECDHE 前向保密聊天工具 - 用户 " + std::to_wstring(my_client_id);
+        SetWindowTextW(hMainWnd, title.c_str());
+        PostMessageW(hMainWnd, WM_LOAD_CHATS, (WPARAM)my_client_id, 0);
+        PostStatus(L"已连接服务器 · 我的 ID 是 " + std::to_wstring(my_client_id));
 
         while (g_connected.load()) {
             uint32_t len = 0;
@@ -580,30 +784,47 @@ static void NetworkThread() {
             Bytes body(packet.begin() + 4, packet.end());
             if (body.size() < 2) continue;
 
-            const uint8_t type = body[1];
-            switch (type) {
-            case proto::SYSTEM:     HandleSystem(body);            break;
-            case proto::HS_INIT:    HandleInit(sender, body);       break;
-            case proto::HS_RESP:    HandleResp(sender, body);       break;
-            case proto::HS_CONFIRM: HandleConfirm(sender, body);    break;
-            case proto::DATA:       HandleData(sender, body);       break;
+            switch (body[1]) {
+            case proto::SYSTEM:     HandleSystem(body);           break;
+            case proto::HS_INIT:    HandleInit(sender, body);     break;
+            case proto::HS_RESP:    HandleResp(sender, body);     break;
+            case proto::HS_CONFIRM: HandleConfirm(sender, body);  break;
+            case proto::DATA:       HandleData(sender, body);     break;
             default: break;
             }
         }
-    } catch (std::exception& e) {
-        UiPost(L"--- 网络错误: " + Utf8ToWide(e.what()) + L" ---\r\n");
+    } catch (...) {
+        // 连接失败/中断，统一在下面处理
     }
 
+    {
+        std::lock_guard<std::mutex> lk(g_net_mu);
+        if (g_sock) {
+            boost::system::error_code ig;
+            g_sock->close(ig);
+            g_sock.reset();
+        }
+    }
     g_connected.store(false);
-    UiPost(L"--- [系统] 与服务器断开连接 ---\r\n");
+
+    // 清空会话（重连后必须重新握手）
+    {
+        std::lock_guard<std::mutex> lk(g_sess_mu);
+        g_sessions.clear();
+    }
+
+    SetWindowTextW(hMainWnd, L"ECDHE 前向保密聊天工具");
+    if (my_client_id == 0)
+        PostStatus(L"无法连接服务器（127.0.0.1:9000），正在重试…", true);
+    else
+        PostStatus(L"与服务器断开，正在重试连接…", true);
+
+    g_connecting.store(false);
 }
 
 // ============================================================ 发送消息 ====
-static void SendUserMessage(int target, const std::wstring& wtext) {
-    if (target == my_client_id) {
-        UiPost(L"[X] 不能给自己发消息\r\n");
-        return;
-    }
+static void SendUserMessage(int target, const std::wstring& wtext, bool& queued) {
+    queued = false;
     std::string text = WideToUtf8(wtext);
 
     std::lock_guard<std::mutex> lk(g_sess_mu);
@@ -612,37 +833,83 @@ static void SendUserMessage(int target, const std::wstring& wtext) {
         LockedSendChat(target, s, text);
     } else {
         s.outbox.push_back(text);
+        queued = true;
         if (s.state != Session::State::Initiator) LockedStartHandshake(target);
-        UiPost(L"--- [握手] 正在与用户" + std::to_wstring(target) + L" 协商 ECDHE 会话，消息已排队 ---\r\n");
     }
 }
 
 // ============================================================ 窗口过程 ====
 static int S(int value) { return (int)(value * g_scale); }
 
+static void LayoutControls(int w, int h) {
+    const int M = S(10);
+    const int sessionW = S(150);
+    const int statusH = S(22);
+    const int inputH = S(30);
+
+    int statusY = h - M - statusH;
+    int inputY  = statusY - S(8) - inputH;
+    int bodyH   = inputY - S(8) - M;
+
+    MoveWindow(hSessionList, M, M, sessionW, bodyH, TRUE);
+    MoveWindow(hChatBox, M + sessionW + S(8), M, w - (sessionW + S(8)) - 2 * M, bodyH, TRUE);
+
+    MoveWindow(hTargetLabel, M, inputY + S(5), S(72), S(20), TRUE);
+    MoveWindow(hTargetBox, M + S(76), inputY, S(52), inputH, TRUE);
+    MoveWindow(hSendButton, w - M - S(76), inputY, S(76), inputH, TRUE);
+    MoveWindow(hInputBox, M + S(136), inputY,
+               (w - M - S(76)) - S(8) - (M + S(136)), inputH, TRUE);
+
+    MoveWindow(hStatus, M, statusY, w - 2 * M, statusH, TRUE);
+}
+
+static void OnSessionChanged() {
+    int sel = (int)SendMessageW(hSessionList, LB_GETCURSEL, 0, 0);
+    if (sel < 0) return;
+    int peer = (int)SendMessageW(hSessionList, LB_GETITEMDATA, sel, 0);
+    if (peer <= 0) return;
+
+    g_activePeer = peer;
+    g_unread.erase(peer);
+    SetWindowTextW(hTargetBox, std::to_wstring(peer).c_str());
+    RefreshChatView();
+    RefreshSessionList();
+    SetFocus(hInputBox);
+}
+
 static void OnSendClicked() {
-    wchar_t target_buf[16] = { 0 };
-    GetWindowTextW(hTargetBox, target_buf, 16);
-    int target = _wtoi(target_buf);
+    wchar_t targetBuf[16] = { 0 };
+    GetWindowTextW(hTargetBox, targetBuf, 16);
+    int target = _wtoi(targetBuf);
 
     int n = GetWindowTextLengthW(hInputBox);
-    if (n <= 0 || target <= 0) return;
+    if (n <= 0) return;
     std::wstring text(n, L'\0');
     GetWindowTextW(hInputBox, &text[0], n + 1);
     text.resize(n);
 
     if (text.empty()) return;
+    if (target <= 0) {
+        SetFocus(hTargetBox);
+        PostStatus(L"请先填写收件人 ID", true);
+        return;
+    }
+    if (target == my_client_id) {
+        PostStatus(L"不能给自己发消息", true);
+        return;
+    }
     if (!g_connected.load()) {
-        UiPost(L"[X] 尚未连接服务器\r\n");
+        PostStatus(L"尚未连接服务器，请稍候…", true);
         return;
     }
 
-    SendUserMessage(target, text);
+    bool queued = false;
+    SendUserMessage(target, text, queued);
 
-    std::wstring shown = L"我 -> 用户" + std::to_wstring(target) + L": " + text + L"\r\n";
-    SaveToLocalFile(shown);
-    UiPost(shown);
+    // 本地回显 + 落盘
+    g_activePeer = target;
     SetWindowTextW(hInputBox, L"");
+    ApplyChatEvent(target, 1, text);
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -654,50 +921,87 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         BOOL dark = TRUE;
         DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
 
-        hChatBox = CreateWindowExW(0, L"EDIT", L"",
+        g_hFont = CreateFontW(-S(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
+        g_hStatusFont = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
+
+        hSessionList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SESSION_LIST, NULL, NULL);
+
+        hChatBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-            S(10), S(10), S(560), S(370), hwnd, NULL, NULL, NULL);
+            0, 0, 0, 0, hwnd, NULL, NULL, NULL);
 
-        CreateWindowW(L"STATIC", L"收件人 ID:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            S(10), S(390), S(80), S(32), hwnd, NULL, NULL, NULL);
+        hTargetLabel = CreateWindowW(L"STATIC", L"收件人 ID:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+            0, 0, 0, 0, hwnd, NULL, NULL, NULL);
 
-        hTargetBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"2",
+        hTargetBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER,
-            S(95), S(390), S(50), S(32), hwnd, NULL, NULL, NULL);
+            0, 0, 0, 0, hwnd, NULL, NULL, NULL);
 
         hInputBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            S(155), S(390), S(280), S(32), hwnd, NULL, NULL, NULL);
+            0, 0, 0, 0, hwnd, NULL, NULL, NULL);
 
-        hSendButton = CreateWindowExW(0, L"BUTTON", L"发送 (Enter)",
+        hSendButton = CreateWindowExW(0, L"BUTTON", L"发送",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
-            S(445), S(390), S(125), S(32), hwnd, (HMENU)1, NULL, NULL);
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SEND, NULL, NULL);
 
-        HFONT hFont = CreateFontW(-S(20), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
-        SendMessageW(hChatBox, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hInputBox, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hSendButton, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hTargetBox, WM_SETFONT, (WPARAM)hFont, TRUE);
+        hStatus = CreateWindowW(L"STATIC", L"正在连接服务器…",
+            WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS | SS_CENTERIMAGE,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_STATUS, NULL, NULL);
+
+        for (HWND h : { hSessionList, hChatBox, hInputBox, hSendButton, hTargetBox, hTargetLabel })
+            SendMessageW(h, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+        SendMessageW(hStatus, WM_SETFONT, (WPARAM)g_hStatusFont, TRUE);
 
         SetWindowTheme(hSendButton, L" ", L" ");
         SetWindowTheme(hInputBox, L" ", L" ");
         SetWindowTheme(hTargetBox, L" ", L" ");
+        SetWindowTheme(hSessionList, L"DarkMode_Explorer", NULL);
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        LayoutControls(rc.right, rc.bottom);
+
+        SetFocus(hInputBox);
         return 0;
     }
 
+    case WM_SIZE:
+        LayoutControls(LOWORD(lParam), HIWORD(lParam));
+        return 0;
+
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+        mmi->ptMinTrackSize.x = S(560);
+        mmi->ptMinTrackSize.y = S(380);
+        return 0;
+    }
+
+    case WM_CTLCOLORLISTBOX:
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
     {
         HDC hdc = (HDC)wParam;
+        HWND ctl = (HWND)lParam;
+
+        if (uMsg == WM_CTLCOLORSTATIC && ctl == hStatus) {
+            SetTextColor(hdc, g_statusError ? RGB(240, 120, 120) : RGB(150, 150, 150));
+            SetBkColor(hdc, RGB(24, 24, 24));
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)g_hDarkBrush;
+        }
         SetTextColor(hdc, RGB(220, 220, 220));
         SetBkColor(hdc, RGB(30, 30, 30));
         SetBkMode(hdc, TRANSPARENT);
         return (LRESULT)g_hDarkBrush;
     }
-    case WM_CTLCOLORBTN:
-        return (LRESULT)GetStockObject(NULL_BRUSH);
 
     case WM_ERASEBKGND:
     {
@@ -710,26 +1014,76 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
     case WM_KEYDOWN:
         if (wParam == VK_RETURN && GetFocus() == hInputBox)
-            SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(1, BN_CLICKED), (LPARAM)hSendButton);
+            SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_SEND, BN_CLICKED), (LPARAM)hSendButton);
         return 0;
 
     case WM_COMMAND:
-        if (LOWORD(wParam) == 1) OnSendClicked();
+        if (LOWORD(wParam) == IDC_SEND && HIWORD(wParam) == BN_CLICKED) {
+            OnSendClicked();
+        } else if (LOWORD(wParam) == IDC_SESSION_LIST && HIWORD(wParam) == LBN_SELCHANGE) {
+            OnSessionChanged();
+        }
         return 0;
 
-    case WM_APPEND_CHAT:
+    case WM_CHAT_EVENT:
     {
-        std::wstring* text = (std::wstring*)lParam;
-        int len = GetWindowTextLengthW(hChatBox);
-        SendMessageW(hChatBox, EM_SETSEL, len, len);
-        SendMessageW(hChatBox, EM_REPLACESEL, FALSE, (LPARAM)text->c_str());
-        SendMessageW(hChatBox, WM_VSCROLL, SB_BOTTOM, 0);
-        delete text;
+        ChatEvent* ev = (ChatEvent*)lParam;
+        if (ev) {
+            ApplyChatEvent(ev->peer, ev->dir, ev->text);
+            delete ev;
+        }
         return 0;
     }
 
+    case WM_SET_STATUS:
+    {
+        std::wstring* text = (std::wstring*)lParam;
+        if (text) {
+            g_statusError = (wParam != 0);
+            SetWindowTextW(hStatus, text->c_str());
+            InvalidateRect(hStatus, NULL, TRUE);
+            delete text;
+        }
+        return 0;
+    }
+
+    case WM_LOAD_CHATS:
+    {
+        LoadAllChats((int)wParam);
+
+        // 自动选中最近一次会话，打开即可看到上次的聊天记录
+        int best = 0;
+        uint64_t bestTs = 0;
+        for (const auto& kv : g_chats) {
+            if (!kv.second.empty() && kv.second.back().ts >= bestTs) {
+                bestTs = kv.second.back().ts;
+                best = kv.first;
+            }
+        }
+        if (best > 0) {
+            g_activePeer = best;
+            SetWindowTextW(hTargetBox, std::to_wstring(best).c_str());
+        }
+
+        RefreshSessionList();
+        RefreshChatView();
+        return 0;
+    }
+
+    case WM_TIMER:
+        if (wParam == IDT_RECONNECT) {
+            if (!g_connected.load() && !g_connecting.load()) {
+                g_connecting.store(true);
+                std::thread(NetworkThread).detach();
+            }
+        }
+        return 0;
+
     case WM_DESTROY:
+        KillTimer(hwnd, IDT_RECONNECT);
         if (g_hDarkBrush) DeleteObject(g_hDarkBrush);
+        if (g_hFont) DeleteObject(g_hFont);
+        if (g_hStatusFont) DeleteObject(g_hStatusFont);
         PostQuitMessage(0);
         return 0;
     }
@@ -743,7 +1097,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ReleaseDC(NULL, screen);
     g_scale = dpiX / 96.0f;
 
-    // 加载/生成长期身份密钥（Ed25519）
+    // 长期身份密钥（Ed25519）
     try {
         std::filesystem::path p = std::filesystem::path(AppDir()) / L"identity.pem";
         g_identity = crypto::ed25519_load_or_create(p.wstring());
@@ -753,22 +1107,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return 1;
     }
 
+    // 载入历史聊天记录
+    LoadAllChats(0);
+
     const wchar_t* CLASS_NAME = L"ChatWindowClass";
     WNDCLASSW wc = { };
     wc.lpfnWndProc   = WindowProc;
     wc.hInstance     = hInstance;
     wc.lpszClassName = CLASS_NAME;
     wc.hbrBackground = CreateSolidBrush(RGB(30, 30, 30));
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     RegisterClassW(&wc);
 
     hMainWnd = CreateWindowExW(0, CLASS_NAME, L"ECDHE 前向保密聊天工具",
-        WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME ^ WS_MAXIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, S(600), S(500), NULL, NULL, hInstance, NULL);
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, S(760), S(560), NULL, NULL, hInstance, NULL);
     if (!hMainWnd) return 0;
 
     ShowWindow(hMainWnd, nCmdShow);
+    RefreshSessionList();
 
+    // 首次连接 + 断线重连定时器
+    g_connecting.store(true);
     std::thread(NetworkThread).detach();
+    SetTimer(hMainWnd, IDT_RECONNECT, 2000, NULL);
 
     MSG msg = { };
     while (GetMessageW(&msg, NULL, 0, 0)) {

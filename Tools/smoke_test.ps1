@@ -1,5 +1,5 @@
 # End-to-end smoke test: start server + 2 GUI clients, exchange E2EE messages,
-# then verify delivery by reading each client's own chat history file.
+# then verify delivery by reading each client's own per-peer chat log.
 # ASCII-only on purpose (Windows PowerShell 5.1 reads .ps1 as ANSI).
 
 Add-Type @"
@@ -44,25 +44,25 @@ public class W32 {
 "@
 
 $ROOT = "D:\ECDHE-Secured Chat System\build\Debug"
-$HIST = Join-Path $env:APPDATA "ECDHE_Chat\history.txt"
+$CHATDIR = Join-Path $env:APPDATA "ECDHE_Chat\chats"
 
 # 1. clean
 Get-Process -Name ClientGUI_App -ErrorAction SilentlyContinue | Stop-Process -Force
 Get-Process -Name Server_App   -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
-Remove-Item $HIST -ErrorAction SilentlyContinue
+Remove-Item $CHATDIR -Recurse -Force -ErrorAction SilentlyContinue
 
 # 2. start server
 $server = Start-Process -FilePath "$ROOT\Server_App.exe" -RedirectStandardOutput "$env:TEMP\srv.log" -PassThru
 Start-Sleep -Milliseconds 800
 
-# 3. start two clients (first one gets ID 1, second gets ID 2)
+# 3. start two clients
 $c1 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -PassThru
 Start-Sleep -Milliseconds 700
 $c2 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -PassThru
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 
-# 4. locate windows / controls (identify client ID from window title, controls from style bits)
+# 4. locate windows / controls (client ID from title, controls from style bits)
 $windows = @()
 foreach ($p in (Get-Process -Name ClientGUI_App -ErrorAction SilentlyContinue)) {
     $p.Refresh()
@@ -73,17 +73,17 @@ Write-Host "client windows: $($windows.Count)"
 $info = @{}
 foreach ($w in $windows) {
     $title = [W32]::Text($w)
-    if ($title -notmatch '([0-9]+)\s*$') { Write-Host "  skip window (no id in title): $title"; continue }
+    if ($title -notmatch '([0-9]+)\s*$') { Write-Host "  skip window (no id): $title"; continue }
     $id = [int]$Matches[1]
 
     $chat = $null; $target = $null; $input = $null
     foreach ($e in [W32]::Edits($w)) {
         $style = [W32]::GetWindowLong($e, -16)
-        if ($style -band 0x800) { $chat = $e }            # ES_READONLY  -> chat log
-        elseif ($style -band 0x2000) { $target = $e }     # ES_NUMBER    -> target id
+        if ($style -band 0x800) { $chat = $e }            # ES_READONLY    -> chat log
+        elseif ($style -band 0x2000) { $target = $e }     # ES_NUMBER      -> target id
         elseif ($style -band 0x80) { $input = $e }        # ES_AUTOHSCROLL -> input
     }
-    Write-Host "  window $w -> client ID $id (chat=$chat target=$target input=$input)"
+    Write-Host "  window -> client ID $id (chat=$chat target=$target input=$input)"
     $info[$id] = @{ Wnd = $w; Chat = $chat; Target = $target; Input = $input }
 }
 
@@ -101,27 +101,33 @@ Start-Sleep -Seconds 2
 [void][W32]::Send($info[2].Wnd, 0x0111, [IntPtr]1, [IntPtr]::Zero)
 Start-Sleep -Seconds 2
 
-# 7. verify via history file (retry a few times; regex uses unicode escapes to stay ASCII)
-$patterns = @(
-    @{ Name = "client 2 decrypted message 1"; Re = "(?m)^[\u4e00-\u9fff]+1: hello-from-client-1" },
-    @{ Name = "client 1 decrypted message 2"; Re = "(?m)^[\u4e00-\u9fff]+2: ack-from-client-2" }
-)
+# 7. verify: client 2 stored "received from 1" in chats\2\1.log ; client 1 stored "received from 2" in chats\1\2.log
+$f12 = Join-Path $CHATDIR "2\1.log"
+$f21 = Join-Path $CHATDIR "1\2.log"
 
-$h = ""
-for ($i = 0; $i -lt 10; $i++) {
-    if (Test-Path $HIST) { $h = Get-Content $HIST -Encoding UTF8 -Raw } else { $h = "" }
-    $allOk = $true
-    foreach ($p in $patterns) { if ($h -notmatch $p.Re) { $allOk = $false } }
-    if ($allOk) { break }
-    Start-Sleep -Milliseconds 500
+function Wait-Log([string]$path, [string]$needle) {
+    for ($i = 0; $i -lt 10; $i++) {
+        if (Test-Path $path) {
+            $c = Get-Content $path -Encoding UTF8 -Raw
+            if ($c -match $needle) { return $c }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (Test-Path $path) { return (Get-Content $path -Encoding UTF8 -Raw) }
+    return ""
 }
 
-Write-Host "`n===== history.txt ====="
-Write-Host $h
+Write-Host "`n===== chats\2\1.log (client 2 view) ====="
+$log12 = Wait-Log $f12 "hello-from-client-1"
+Write-Host $log12
+Write-Host "`n===== chats\1\2.log (client 1 view) ====="
+$log21 = Wait-Log $f21 "ack-from-client-2"
+Write-Host $log21
+
 Write-Host "`n===== checks ====="
-foreach ($p in $patterns) {
-    if ($h -match $p.Re) { Write-Host "  [OK] $($p.Name)" } else { Write-Host "  [FAIL] $($p.Name)" }
-}
+if ($log12 -match "(?m)`t0`thello-from-client-1") { Write-Host "  [OK] client 2 decrypted message 1" } else { Write-Host "  [FAIL] client 2 did not get message 1" }
+if ($log21 -match "(?m)`t0`tack-from-client-2")   { Write-Host "  [OK] client 1 decrypted message 2" } else { Write-Host "  [FAIL] client 1 did not get message 2" }
+if ($log21 -match "(?m)`t1`thello-from-client-1") { Write-Host "  [OK] outgoing message persisted" } else { Write-Host "  [FAIL] outgoing message not persisted" }
 
 Write-Host "`n===== server log ====="
 if (Test-Path "$env:TEMP\srv.log") { Get-Content "$env:TEMP\srv.log" -Encoding UTF8 }

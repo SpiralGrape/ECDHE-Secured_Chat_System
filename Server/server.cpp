@@ -71,13 +71,19 @@ static bool SendFrame(ClientSession& c, const unsigned char* payload, uint32_t l
 }
 
 // 向发送方回报一条系统通知（明文，只用于“用户不在线”等提示）
+// 帧格式与转发帧保持一致：[发送者ID(4)][payload]，发送者固定为 -1 表示系统消息
 static void SendSystem(ClientSession& c, int related_id, const std::string& text) {
     proto::Bytes payload;
     payload.push_back(proto::VERSION);
     payload.push_back(proto::SYSTEM);
     proto::append_u32(payload, (uint32_t)related_id);
     proto::append(payload, text.data(), text.size());
-    SendFrame(c, payload.data(), (uint32_t)payload.size());
+
+    std::vector<unsigned char> frame(4 + payload.size());
+    proto::put_u32(frame.data(), (uint32_t)-1);          // -1 = 系统消息
+    std::memcpy(frame.data() + 4, payload.data(), payload.size());
+
+    SendFrame(c, frame.data(), (uint32_t)frame.size());
 }
 
 // ------------------------------------------------------------ 处理客户端 ----
