@@ -339,17 +339,16 @@ def fig_handshake():
         ax.plot([x, x], [9, 90], color="#5a6b7c", lw=1.1, ls=(0, (6, 3)), zorder=1)
     box(ax, xa - 10, 88, 20, 9, "发起方 A（发送方）", BLUE, 8.2)
     box(ax, xb - 10, 88, 20, 9, "响应方 B（接收方）", GREEN, 8.2)
-    ax.add_patch(plt.Rectangle((46, 34), 8, 56, fc="#fdfbf7", ec="#c9861a",
+    ax.add_patch(plt.Rectangle((46.5, 34), 7, 56, fc="#fdfbf7", ec="#c9861a",
                                lw=1.0, ls=(0, (4, 3)), zorder=0))
-    ax.text(50, 62, "中继服务器：原样转发，无密钥", ha="center", va="center",
-            fontsize=7.4, color="#a86a12", zorder=1, rotation=90,
-            bbox=dict(fc="#fdfbf7", ec="none", pad=1.5))
+    note(ax, 50, 94, "中继服务器：原样转发，不持有任何密钥", 7.4, "#a86a12")
+    note(ax, 50, 56, "无密钥", 7.4, "#a86a12")
 
     arrow(ax, (xa, 82), (xb, 82), label="① HS_INIT（162 B）：pubA · nonceA · idpubA · SigA", fs=8, dy=3.2)
-    box(ax, xb - 34, 72, 33, 7, "验签 SigA → 生成 pubB / nonceB\n→ 计算 Z → 派生双向链密钥", AMBER, 7.4)
+    box(ax, 53.5, 72, 33, 7, "验签 SigA → 生成 pubB / nonceB\n→ 计算 Z → 派生双向链密钥", AMBER, 7.4)
     arrow(ax, (xb, 65), (xa, 65), label="② HS_RESP（186 B）：pubB · nonceB · idpubB · SigB · MAC_B",
           fs=8, dy=3.2, color="#2e8b57")
-    box(ax, xa + 1, 55, 33, 7, "验签 SigB（覆盖 INIT + RESP 前 90 B）\n→ 验 MAC_B → 派生会话密钥", AMBER, 7.4)
+    box(ax, 13.5, 55, 33, 7, "验签 SigB（覆盖 INIT + RESP 前 90 B）\n→ 验 MAC_B → 派生会话密钥", AMBER, 7.4)
     arrow(ax, (xa, 47), (xb, 47), label="③ HS_CONFIRM（42 B）：MAC_A", fs=8, dy=3.2)
     note(ax, xb - 16, 39, "验 MAC_A → 双方进入 Established", 8, "#2e8b57")
 
