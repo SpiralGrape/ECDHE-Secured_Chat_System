@@ -23,6 +23,11 @@ CMakeFiles/
 *.pem
 history.txt
 
+# 文档排版与抓图脚本（本地使用，不随仓库发布）
+Tools/make_*.py
+Tools/build_reports_safe.py
+Tools/capture_shots.ps1
+
 # Office 打开文档时产生的临时锁文件
 ~$*
 
