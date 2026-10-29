@@ -44,22 +44,24 @@ public class W32 {
 "@
 
 $ROOT = "D:\ECDHE-Secured Chat System\build\Debug"
-$CHATDIR = Join-Path $env:APPDATA "ECDHE_Chat\chats"
+$OUTDIR = Join-Path $env:TEMP "chat_smoke"
+$PROF1 = Join-Path $env:APPDATA "ECDHE_Chat\profiles\p1"
+$PROF2 = Join-Path $env:APPDATA "ECDHE_Chat\profiles\p2"
 
 # 1. clean
 Get-Process -Name ClientGUI_App -ErrorAction SilentlyContinue | Stop-Process -Force
 Get-Process -Name Server_App   -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
-Remove-Item $CHATDIR -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item $PROF1,$PROF2 -Recurse -Force -ErrorAction SilentlyContinue
 
 # 2. start server
 $server = Start-Process -FilePath "$ROOT\Server_App.exe" -RedirectStandardOutput "$env:TEMP\srv.log" -PassThru
 Start-Sleep -Milliseconds 800
 
 # 3. start two clients
-$c1 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -PassThru
+$c1 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -ArgumentList "--profile","p1" -PassThru
 Start-Sleep -Milliseconds 700
-$c2 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -PassThru
+$c2 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -ArgumentList "--profile","p2" -PassThru
 Start-Sleep -Seconds 3
 
 # 4. locate windows / controls (client ID from title, controls from style bits)
@@ -101,33 +103,50 @@ Start-Sleep -Seconds 2
 [void][W32]::Send($info[2].Wnd, 0x0111, [IntPtr]1, [IntPtr]::Zero)
 Start-Sleep -Seconds 2
 
-# 7. verify: client 2 stored "received from 1" in chats\2\1.log ; client 1 stored "received from 2" in chats\1\2.log
-$f12 = Join-Path $CHATDIR "2\1.log"
-$f21 = Join-Path $CHATDIR "1\2.log"
+# 7. 聊天记录已加密存储：先关掉客户端，再用 --dump 导出解密后的明文进行校验
+Get-Process -Name ClientGUI_App -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 600
 
-function Wait-Log([string]$path, [string]$needle) {
-    for ($i = 0; $i -lt 10; $i++) {
-        if (Test-Path $path) {
-            $c = Get-Content $path -Encoding UTF8 -Raw
-            if ($c -match $needle) { return $c }
-        }
-        Start-Sleep -Milliseconds 500
-    }
+$dump2 = Join-Path $OUTDIR "p2_dump.txt"
+$dump1 = Join-Path $OUTDIR "p1_dump.txt"
+Remove-Item $dump1,$dump2 -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $OUTDIR | Out-Null
+
+Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -ArgumentList @("--profile","p2","--dump",$dump2) -Wait
+Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -ArgumentList @("--profile","p1","--dump",$dump1) -Wait
+Start-Sleep -Milliseconds 500
+
+function Read-Dump([string]$path) {
     if (Test-Path $path) { return (Get-Content $path -Encoding UTF8 -Raw) }
     return ""
 }
+$log12 = Read-Dump $dump2
+$log21 = Read-Dump $dump1
 
-Write-Host "`n===== chats\2\1.log (client 2 view) ====="
-$log12 = Wait-Log $f12 "hello-from-client-1"
+Write-Host "`n===== exported history (client 2 view) ====="
 Write-Host $log12
-Write-Host "`n===== chats\1\2.log (client 1 view) ====="
-$log21 = Wait-Log $f21 "ack-from-client-2"
+Write-Host "`n===== exported history (client 1 view) ====="
 Write-Host $log21
 
 Write-Host "`n===== checks ====="
-if ($log12 -match "(?m)`t0`thello-from-client-1") { Write-Host "  [OK] client 2 decrypted message 1" } else { Write-Host "  [FAIL] client 2 did not get message 1" }
-if ($log21 -match "(?m)`t0`tack-from-client-2")   { Write-Host "  [OK] client 1 decrypted message 2" } else { Write-Host "  [FAIL] client 1 did not get message 2" }
-if ($log21 -match "(?m)`t1`thello-from-client-1") { Write-Host "  [OK] outgoing message persisted" } else { Write-Host "  [FAIL] outgoing message not persisted" }
+if ($log12 -match "(?m)^1`t0`thello-from-client-1") { Write-Host "  [OK] client 2 decrypted message 1" } else { Write-Host "  [FAIL] client 2 did not get message 1" }
+if ($log21 -match "(?m)^2`t0`tack-from-client-2")   { Write-Host "  [OK] client 1 decrypted message 2" } else { Write-Host "  [FAIL] client 1 did not get message 2" }
+if ($log21 -match "(?m)^2`t1`thello-from-client-1") { Write-Host "  [OK] outgoing message persisted" } else { Write-Host "  [FAIL] outgoing message not persisted" }
+
+# 磁盘上的记录文件必须是密文（不应出现明文）
+$stored = Get-ChildItem -Path (Join-Path $PROF2 "chats") -Recurse -Filter "1.log" -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+if ($stored) {
+    $raw = Get-Content $stored.FullName -Encoding UTF8 -Raw
+    if ($raw -match "hello-from-client-1") {
+        Write-Host "  [FAIL] chat log stored in plaintext"
+    } else {
+        Write-Host "  [OK] chat log encrypted at rest"
+        Write-Host ("         " + $raw.Substring(0, [Math]::Min(64, $raw.Length)) + "...")
+    }
+} else {
+    Write-Host "  [SKIP] chat log not found"
+}
 
 Write-Host "`n===== server log ====="
 if (Test-Path "$env:TEMP\srv.log") { Get-Content "$env:TEMP\srv.log" -Encoding UTF8 }

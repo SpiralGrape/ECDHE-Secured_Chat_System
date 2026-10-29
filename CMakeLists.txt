@@ -47,6 +47,7 @@ target_link_libraries(ClientGUI_App PRIVATE
     ws2_32
     uxtheme
     dwmapi
+    crypt32      # DPAPI：加密保存身份私钥
 )
 
 # ------------------------------------------------------------------ 自测 ----

@@ -255,6 +255,41 @@ inline Bytes ed25519_public_raw(EVP_PKEY* pkey) {
     return out;
 }
 
+// 导出 32 字节原始私钥（仅用于派生本地存储密钥，不得外传）
+inline Bytes ed25519_private_raw(EVP_PKEY* pkey) {
+    size_t len = 0;
+    if (EVP_PKEY_get_raw_private_key(pkey, nullptr, &len) <= 0)
+        throw std::runtime_error("ed25519: 读取私钥失败");
+    Bytes out(len);
+    if (EVP_PKEY_get_raw_private_key(pkey, out.data(), &len) <= 0)
+        throw std::runtime_error("ed25519: 读取私钥失败");
+    out.resize(len);
+    return out;
+}
+
+// 内存版 PEM 编解码（配合 DPAPI 等外部保护机制使用）
+inline std::string ed25519_to_pem(EVP_PKEY* pkey) {
+    BIO* bio = BIO_new(BIO_s_mem());
+    if (!bio) return std::string();
+    std::string out;
+    if (PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1) {
+        char* p = nullptr;
+        long len = BIO_get_mem_data(bio, &p);
+        if (len > 0) out.assign(p, (size_t)len);
+    }
+    BIO_free(bio);
+    return out;
+}
+
+inline PkeyPtr ed25519_from_pem(const std::string& pem) {
+    if (pem.empty()) return PkeyPtr(nullptr);
+    BIO* bio = BIO_new_mem_buf(pem.data(), (int)pem.size());
+    if (!bio) return PkeyPtr(nullptr);
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    return PkeyPtr(pkey);
+}
+
 inline Bytes ed25519_sign(EVP_PKEY* priv, const Bytes& msg) {
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) throw std::runtime_error("ed25519: md ctx");

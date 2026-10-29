@@ -52,13 +52,14 @@ public class M32 {
 $ROOT   = "D:\ECDHE-Secured Chat System\build\Debug"
 $OUTDIR = Join-Path $env:TEMP "mitm_demo"
 $LOG    = Join-Path $OUTDIR "mitm.log"
+$PROF1  = Join-Path $env:APPDATA "ECDHE_Chat\profiles\p1"
+$PROF2  = Join-Path $env:APPDATA "ECDHE_Chat\profiles\p2"
 
 Get-Process -Name ClientGUI_App,MitmRelay,Server_App -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 
 # 清空历史与指纹固定，模拟“第一次与对方通信”
-Remove-Item "$env:APPDATA\ECDHE_Chat\chats" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$env:APPDATA\ECDHE_Chat\pins"  -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item $PROF1,$PROF2 -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $OUTDIR | Out-Null
 
 # 1. 启动 MITM 中继（冒充服务器）
@@ -66,9 +67,9 @@ $mitm = Start-Process -FilePath "$ROOT\MitmRelay.exe" -RedirectStandardOutput $L
 Start-Sleep -Milliseconds 900
 
 # 2. 启动两个客户端（它们并不知道连的是中间人）
-$c1 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -PassThru
+$c1 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -ArgumentList "--profile","p1" -PassThru
 Start-Sleep -Milliseconds 700
-$c2 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -PassThru
+$c2 = Start-Process -FilePath "$ROOT\ClientGUI_App.exe" -ArgumentList "--profile","p2" -PassThru
 Start-Sleep -Seconds 3
 
 # 3. 定位窗口与控件
@@ -134,7 +135,7 @@ Get-Process -Name ClientGUI_App,MitmRelay -ErrorAction SilentlyContinue | Stop-P
 Start-Sleep -Milliseconds 300
 
 # 清理本次演示写入的指纹（否则下次连真服务器会因指纹不一致而被阻断）
-Remove-Item "$env:APPDATA\ECDHE_Chat\pins" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item $PROF1,$PROF2 -Recurse -Force -ErrorAction SilentlyContinue
 
 # 6. 展示 MITM 视角
 Write-Host "`n================= MITM view (what the attacker sees) ================="

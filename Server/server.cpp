@@ -15,7 +15,9 @@
 #include <boost/asio.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -34,6 +36,7 @@ struct ClientSession {
     int id;
     std::mutex write_mu;              // 保证同一 socket 上不会出现帧交错
     std::atomic<bool> alive{ true };
+    std::atomic<long long> lastActive{ 0 };   // 最后活动时间（用于心跳超时清理）
 
     ClientSession(tcp::socket&& s, int i) : sock(std::move(s)), id(i) {}
 };
@@ -70,6 +73,14 @@ static bool SendFrame(ClientSession& c, const unsigned char* payload, uint32_t l
     return true;
 }
 
+// 向指定客户端发送一条带“发送者 ID”的帧
+static bool SendPayload(ClientSession& c, int senderId, const proto::Bytes& payload) {
+    std::vector<unsigned char> frame(4 + payload.size());
+    proto::put_u32(frame.data(), (uint32_t)senderId);
+    if (!payload.empty()) std::memcpy(frame.data() + 4, payload.data(), payload.size());
+    return SendFrame(c, frame.data(), (uint32_t)frame.size());
+}
+
 // 向发送方回报一条系统通知（明文，只用于“用户不在线”等提示）
 // 帧格式与转发帧保持一致：[发送者ID(4)][payload]，发送者固定为 -1 表示系统消息
 static void SendSystem(ClientSession& c, int related_id, const std::string& text) {
@@ -79,11 +90,7 @@ static void SendSystem(ClientSession& c, int related_id, const std::string& text
     proto::append_u32(payload, (uint32_t)related_id);
     proto::append(payload, text.data(), text.size());
 
-    std::vector<unsigned char> frame(4 + payload.size());
-    proto::put_u32(frame.data(), (uint32_t)-1);          // -1 = 系统消息
-    std::memcpy(frame.data() + 4, payload.data(), payload.size());
-
-    SendFrame(c, frame.data(), (uint32_t)frame.size());
+    SendPayload(c, -1, payload);
 }
 
 // ------------------------------------------------------------ 处理客户端 ----
@@ -116,8 +123,21 @@ static void HandleClient(SessionPtr client) {
         boost::asio::read(client->sock, boost::asio::buffer(buf), ec);
         if (ec) break;
 
+        client->lastActive.store((long long)time(nullptr));
+
         const int target = (int)proto::get_u32(buf.data());
         if (target == my_id) continue;
+
+        // 目标为 0：发给服务器本身（心跳），不转发
+        if (target == proto::SERVER_ID) {
+            if (buf.size() >= 6 && buf[5] == proto::PING) {
+                proto::Bytes pong;
+                pong.push_back(proto::VERSION);
+                pong.push_back(proto::PONG);
+                SendPayload(*client, proto::SERVER_ID, pong);
+            }
+            continue;
+        }
 
         // 3. 查找目标（锁内只做查找，锁外做阻塞写，避免全局串行化）
         SessionPtr dst;
@@ -175,6 +195,31 @@ int main() {
 
     std::cout << "ECDHE 安全聊天中继已启动，监听 9000 端口（服务器无法解密聊天内容）\n";
 
+    // 心跳巡检：每 10 秒清理一次超过 60 秒无活动的连接，
+    // 避免进程崩溃/拔网线后客户端 ID 被永久占用
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            const long long now = (long long)time(nullptr);
+
+            std::vector<SessionPtr> dead;
+            {
+                std::lock_guard<std::mutex> lk(g_clients_mu);
+                for (const auto& kv : g_clients) {
+                    if (now - kv.second->lastActive.load() > 60) dead.push_back(kv.second);
+                }
+            }
+            for (const auto& c : dead) {
+                if (c->alive.exchange(false)) {
+                    Log("[系统] 客户端 " + std::to_string(c->id) + " 心跳超时，断开连接");
+                    boost::system::error_code ig;
+                    std::lock_guard<std::mutex> lk(c->write_mu);
+                    c->sock.close(ig);
+                }
+            }
+        }
+    }).detach();
+
     int next_id = 1;
     for (;;) {
         tcp::socket s(io);
@@ -187,6 +232,7 @@ int main() {
             g_clients[client->id] = client;
         }
         std::cout << "[系统] 客户端接入，分配 ID " << client->id << "\n";
-        std::thread(HandleClient, client).detach();    }
+        std::thread(HandleClient, client).detach();
+    }
     return 0;
 }

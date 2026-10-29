@@ -32,6 +32,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
+#include <dpapi.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
 
@@ -51,7 +52,6 @@ using crypto::Bytes;
 // ============================================================== 常量/消息 ====
 #define WM_CHAT_EVENT   (WM_APP + 1)   // lParam = new ChatEvent
 #define WM_SET_STATUS   (WM_APP + 2)   // wParam = 是否错误, lParam = new std::wstring
-#define WM_LOAD_CHATS   (WM_APP + 3)   // wParam = 本地客户端 ID（加载该实例的聊天记录）
 
 #define IDC_SEND          1
 #define IDC_SESSION_LIST  101
@@ -73,11 +73,18 @@ std::shared_ptr<tcp::socket>              g_sock;
 std::mutex                                g_net_mu;
 std::atomic<bool>                         g_connected(false);
 std::atomic<bool>                         g_connecting(false);
+std::atomic<long long>                    g_lastPong(0);      // 最后一次收到 PONG 的时间
+std::atomic<long long>                    g_lastPing(0);
 int                                       my_client_id = 0;
+
+// 单条消息上限（远小于协议帧上限，旧版无此校验会导致发长文直接断连）
+constexpr size_t MAX_TEXT_BYTES = 64 * 1024;
 
 // 身份（长期主密钥）
 crypto::PkeyPtr g_identity;
 std::wstring    g_my_fingerprint;
+crypto::Bytes   g_storageKey;      // 本地聊天记录的加密密钥（由身份私钥派生）
+std::wstring    g_dumpPath;        // --dump <file>：导出历史后退出（用于测试/备份）
 
 // 会话（跨线程访问，用 g_sess_mu 保护）
 struct PeerSession {
@@ -98,7 +105,6 @@ struct ChatMsg {
 std::map<int, std::vector<ChatMsg>> g_chats;
 std::set<int>  g_unread;
 int            g_activePeer = 0;            // 0 表示无选中会话
-int            g_profileId  = 0;            // 聊天记录所属的本地实例（= 服务器分配的 ID）
 
 // 网络线程 → UI 线程的消息
 struct ChatEvent {
@@ -134,19 +140,27 @@ static std::wstring HexW(const Bytes& b, size_t n = 8) {
     return out;
 }
 
+// 实例档案名（命令行 --profile xxx）。为空表示默认档案。
+// 同一台机器上同时跑多个客户端时，用不同档案可以各自拥有独立的身份与历史。
+std::wstring g_profileName;
+
 static std::wstring AppDir() {
     wchar_t buf[MAX_PATH] = { 0 };
     DWORD n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
     std::wstring dir = (n > 0) ? std::wstring(buf, n) : std::wstring(L".");
     dir += L"\\ECDHE_Chat";
+    if (!g_profileName.empty()) {
+        dir += L"\\profiles\\" + g_profileName;
+    }
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return dir;
 }
 
-static std::wstring ChatsDir(int profileId) {
+// 历史记录按“本地身份指纹”归档：服务器分配的 ID 是临时的，身份是持久的
+static std::wstring ChatsDir() {
     std::wstring dir = AppDir() + L"\\chats";
-    if (profileId > 0) dir += L"\\" + std::to_wstring(profileId);
+    if (!g_my_fingerprint.empty()) dir += L"\\" + g_my_fingerprint;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return dir;
@@ -191,30 +205,142 @@ static std::wstring Unesc(const std::wstring& s) {
     return o;
 }
 
+// ========================================================== 本机文件 IO ====
+static bool ReadFileBytes(const std::wstring& path, std::string& out) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    out.clear();
+    char buf[4096];
+    size_t n = 0;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    fclose(f);
+    return true;
+}
+
+static bool WriteFileBytes(const std::wstring& path, const std::string& data) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
+    bool ok = data.empty() || fwrite(data.data(), 1, data.size(), f) == data.size();
+    fclose(f);
+    return ok;
+}
+
+// --------------------------------------------------- DPAPI 私钥保护 --------
+// 用当前 Windows 用户凭据加密身份私钥：文件被拷到其他账户/机器上也无法解密
+static bool DpapiProtect(const std::string& in, std::string& out) {
+    DATA_BLOB din { (DWORD)in.size(), (BYTE*)in.data() };
+    DATA_BLOB dout { 0, nullptr };
+    if (!CryptProtectData(&din, L"ECDHE_Chat identity", nullptr, nullptr, nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN, &dout))
+        return false;
+    out.assign((const char*)dout.pbData, dout.cbData);
+    LocalFree(dout.pbData);
+    return true;
+}
+
+static bool DpapiUnprotect(const std::string& in, std::string& out) {
+    DATA_BLOB din { (DWORD)in.size(), (BYTE*)in.data() };
+    DATA_BLOB dout { 0, nullptr };
+    if (!CryptUnprotectData(&din, nullptr, nullptr, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &dout))
+        return false;
+    out.assign((const char*)dout.pbData, dout.cbData);
+    LocalFree(dout.pbData);
+    return true;
+}
+
+static const char* kHexDigits = "0123456789abcdef";
+
+static std::string BytesToHex(const crypto::Bytes& b) {
+    std::string s;
+    s.reserve(b.size() * 2);
+    for (unsigned char c : b) { s.push_back(kHexDigits[c >> 4]); s.push_back(kHexDigits[c & 0x0F]); }
+    return s;
+}
+
+static int HexVal(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return (int)(c - L'0');
+    if (c >= L'a' && c <= L'f') return (int)(c - L'a') + 10;
+    if (c >= L'A' && c <= L'F') return (int)(c - L'A') + 10;
+    return -1;
+}
+
+static bool HexToBytes(const std::wstring& hex, crypto::Bytes& out) {
+    if (hex.empty() || hex.size() % 2) return false;
+    out.clear();
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        int hi = HexVal(hex[i]), lo = HexVal(hex[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back((unsigned char)((hi << 4) | lo));
+    }
+    return true;
+}
+
+// ============================================================ 身份密钥 IO ====
+static void SaveIdentity(EVP_PKEY* key, const std::wstring& path) {
+    std::string pem = crypto::ed25519_to_pem(key);
+    if (pem.empty()) return;
+    std::string blob;
+    if (!DpapiProtect(pem, blob)) blob = pem;   // DPAPI 不可用时退回明文，保证可用性
+    WriteFileBytes(path, blob);
+}
+
+static crypto::PkeyPtr LoadIdentity(const std::wstring& path) {
+    std::string raw;
+    if (ReadFileBytes(path, raw) && !raw.empty()) {
+        std::string plain;
+        if (DpapiUnprotect(raw, plain)) {                     // 正常：DPAPI 加密存储
+            crypto::PkeyPtr k = crypto::ed25519_from_pem(plain);
+            if (k) return k;
+        }
+        crypto::PkeyPtr k = crypto::ed25519_from_pem(raw);    // 兼容旧版明文 PEM
+        if (k) { SaveIdentity(k.get(), path); return k; }     // 自动升级为加密存储
+    }
+    crypto::PkeyPtr k = crypto::ed25519_generate();
+    SaveIdentity(k.get(), path);
+    return k;
+}
+
 // ============================================================ 聊天记录 IO ====
 static std::wstring ChatFile(int peer) {
-    return ChatsDir(g_profileId) + L"\\" + std::to_wstring(peer) + L".log";
+    return ChatsDir() + L"\\" + std::to_wstring(peer) + L".log";
 }
 
 static void SaveChatMsg(int peer, const ChatMsg& m) {
+    if (g_storageKey.size() != 32) return;
+
+    std::wstring plain = std::to_wstring(m.ts) + L"\t" + std::to_wstring(m.dir) + L"\t" + Esc(m.text);
+    std::string plainU8 = WideToUtf8(plain);
+
+    crypto::Bytes aad;
+    proto::append_u32(aad, (uint32_t)peer);       // 绑定会话号，防止文件被拼接/替换
+
+    crypto::Bytes nonce = crypto::random_bytes(12);
+    crypto::Bytes ct;
+    try {
+        ct = crypto::aead_encrypt(g_storageKey, nonce, plainU8, aad);
+    } catch (...) {
+        return;
+    }
+
+    crypto::Bytes blob = nonce;
+    blob.insert(blob.end(), ct.begin(), ct.end());
+    std::string line = BytesToHex(blob) + "\n";
+
     FILE* f = nullptr;
     if (_wfopen_s(&f, ChatFile(peer).c_str(), L"ab") != 0 || !f) return;
-
-    wchar_t head[64];
-    swprintf_s(head, L"%llu\t%d\t", (unsigned long long)m.ts, m.dir);
-    std::string line = WideToUtf8(std::wstring(head) + Esc(m.text) + L"\n");
     fwrite(line.data(), 1, line.size(), f);
     fclose(f);
 }
 
-static void LoadAllChats(int profileId) {
+static void LoadAllChats() {
     g_chats.clear();
     g_unread.clear();
     g_activePeer = 0;
-    g_profileId  = profileId;
 
     std::error_code ec;
-    std::filesystem::path dir(ChatsDir(profileId));
+    std::filesystem::path dir(ChatsDir());
     if (!std::filesystem::exists(dir, ec)) return;
 
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
@@ -242,15 +368,30 @@ static void LoadAllChats(int profileId) {
             pos = eol + 1;
             if (line.empty()) continue;
 
-            size_t t1 = line.find(L'\t');
+            // 每条记录 = hex(nonce(12) || 密文 || Tag(16))
+            crypto::Bytes blob;
+            if (!HexToBytes(line, blob) || blob.size() < 12 + 16) continue;
+
+            crypto::Bytes nonce(blob.begin(), blob.begin() + 12);
+            crypto::Bytes ct(blob.begin() + 12, blob.end());
+            crypto::Bytes aad;
+            proto::append_u32(aad, (uint32_t)peer);
+
+            std::string plainU8;
+            if (g_storageKey.size() != 32 ||
+                !crypto::aead_decrypt(g_storageKey, nonce, ct, aad, plainU8))
+                continue;   // 密钥不匹配（换了身份/被篡改）则跳过该条
+
+            std::wstring plain = Utf8ToWide(plainU8);
+            size_t t1 = plain.find(L'\t');
             if (t1 == std::wstring::npos) continue;
-            size_t t2 = line.find(L'\t', t1 + 1);
+            size_t t2 = plain.find(L'\t', t1 + 1);
             if (t2 == std::wstring::npos) continue;
 
             ChatMsg m;
-            m.ts  = _wcstoui64(line.substr(0, t1).c_str(), nullptr, 10);
-            m.dir = _wtoi(line.substr(t1 + 1, t2 - t1 - 1).c_str());
-            m.text = Unesc(line.substr(t2 + 1));
+            m.ts   = _wcstoui64(plain.substr(0, t1).c_str(), nullptr, 10);
+            m.dir  = _wtoi(plain.substr(t1 + 1, t2 - t1 - 1).c_str());
+            m.text = Unesc(plain.substr(t2 + 1));
             g_chats[peer].push_back(m);
         }
     }
@@ -261,7 +402,7 @@ static std::wstring PinsFile() {
     std::wstring dir = AppDir() + L"\\pins";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    return dir + L"\\" + std::to_wstring(g_profileId) + L".log";
+    return dir + L"\\" + (g_my_fingerprint.empty() ? std::wstring(L"default") : g_my_fingerprint) + L".log";
 }
 
 static void SavePin(int peer, const crypto::Bytes& pub) {
@@ -620,10 +761,11 @@ static void NetworkThread() {
             g_sock = sock;
             g_connected.store(true);
         }
+        g_lastPong.store((long long)time(nullptr));
+        g_lastPing.store((long long)time(nullptr));
 
         std::wstring title = L"ECDHE 前向保密聊天工具 - 用户 " + std::to_wstring(my_client_id);
         SetWindowTextW(hMainWnd, title.c_str());
-        PostMessageW(hMainWnd, WM_LOAD_CHATS, (WPARAM)my_client_id, 0);
         PostStatus(L"已连接服务器 · 我的 ID 是 " + std::to_wstring(my_client_id));
 
         while (g_connected.load()) {
@@ -639,6 +781,12 @@ static void NetworkThread() {
             const int sender = (int)proto::get_u32(packet.data());
             Bytes body(packet.begin() + 4, packet.end());
             if (body.size() < 2) continue;
+
+            // 服务器自身的控制帧（心跳应答）
+            if (sender == proto::SERVER_ID) {
+                if (body[1] == proto::PONG) g_lastPong.store((long long)time(nullptr));
+                continue;
+            }
 
             switch (body[1]) {
             case proto::SYSTEM:     HandleSystem(body);           break;
@@ -679,9 +827,15 @@ static void NetworkThread() {
 }
 
 // ============================================================ 发送消息 ====
-static void SendUserMessage(int target, const std::wstring& wtext, bool& queued) {
+static bool SendUserMessage(int target, const std::wstring& wtext, bool& queued) {
     queued = false;
     std::string text = WideToUtf8(wtext);
+
+    if (text.empty()) return false;
+    if (text.size() > MAX_TEXT_BYTES) {
+        PostStatus(L"消息过长（最大 64 KB），已取消发送", true);
+        return false;
+    }
 
     std::lock_guard<std::mutex> lk(g_sess_mu);
     PeerSession& s = g_sessions[target];
@@ -692,6 +846,7 @@ static void SendUserMessage(int target, const std::wstring& wtext, bool& queued)
         queued = true;
         if (s.crypto.state() != securechat::SecureSession::State::Initiating) LockedStartHandshake(target);
     }
+    return true;
 }
 
 // ============================================================ 窗口过程 ====
@@ -768,7 +923,7 @@ static void OnSendClicked() {
     }
 
     bool queued = false;
-    SendUserMessage(target, text, queued);
+    if (!SendUserMessage(target, text, queued)) return;    // 过长/为空时已提示，不做本地回显
 
     // 本地回显 + 落盘
     g_activePeer = target;
@@ -911,36 +1066,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
-    case WM_LOAD_CHATS:
-    {
-        LoadAllChats((int)wParam);
-        {
-            std::lock_guard<std::mutex> lk(g_sess_mu);
-            LoadPins();
-        }
-
-        // 自动选中最近一次会话，打开即可看到上次的聊天记录
-        int best = 0;
-        uint64_t bestTs = 0;
-        for (const auto& kv : g_chats) {
-            if (!kv.second.empty() && kv.second.back().ts >= bestTs) {
-                bestTs = kv.second.back().ts;
-                best = kv.first;
-            }
-        }
-        if (best > 0) {
-            g_activePeer = best;
-            SetWindowTextW(hTargetBox, std::to_wstring(best).c_str());
-        }
-
-        RefreshSessionList();
-        RefreshChatView();
-        return 0;
-    }
-
     case WM_TIMER:
         if (wParam == IDT_RECONNECT) {
-            if (!g_connected.load() && !g_connecting.load()) {
+            if (g_connected.load()) {
+                const long long now = (long long)time(nullptr);
+
+                // 心跳超时：15 秒未收到 PONG 就判定断线，主动关闭 socket 触发重连
+                if (now - g_lastPong.load() > 15) {
+                    PostStatus(L"连接已超时，正在重连…", true);
+                    {
+                        std::lock_guard<std::mutex> lk(g_net_mu);
+                        if (g_sock) {
+                            boost::system::error_code ig;
+                            g_sock->close(ig);
+                        }
+                    }
+                    g_connected.store(false);
+                } else if (now - g_lastPing.load() >= 5) {
+                    g_lastPing.store(now);
+                    Bytes ping;
+                    ping.push_back(proto::VERSION);
+                    ping.push_back(proto::PING);
+                    SendRaw(MakeFrame(proto::SERVER_ID, ping));
+                }
+            } else if (!g_connecting.load()) {
                 g_connecting.store(true);
                 std::thread(NetworkThread).detach();
             }
@@ -959,24 +1108,67 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 // ================================================================ 入口 ====
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow) {
+    // 解析 --profile <name> / --dump <file>（可选）
+    if (lpCmdLine && *lpCmdLine) {
+        std::string cmd(lpCmdLine);
+
+        auto takeArg = [&](const char* flag) -> std::string {
+            size_t p = cmd.find(flag);
+            if (p == std::string::npos) return std::string();
+            std::string rest = cmd.substr(p + strlen(flag));
+            size_t b = rest.find_first_not_of(" \t\"");
+            if (b == std::string::npos) return std::string();
+            size_t e = rest.find_first_of(" \t\"", b);
+            return rest.substr(b, (e == std::string::npos) ? std::string::npos : e - b);
+        };
+
+        std::string profile = takeArg("--profile");
+        if (!profile.empty()) g_profileName = Utf8ToWide(profile);
+
+        std::string dump = takeArg("--dump");
+        if (!dump.empty()) g_dumpPath = Utf8ToWide(dump);
+    }
+
     HDC screen = GetDC(NULL);
     int dpiX = GetDeviceCaps(screen, LOGPIXELSX);
     ReleaseDC(NULL, screen);
     g_scale = dpiX / 96.0f;
 
-    // 长期身份密钥（Ed25519）
+    // 长期身份密钥（Ed25519，DPAPI 加密存储）
     try {
         std::filesystem::path p = std::filesystem::path(AppDir()) / L"identity.pem";
-        g_identity = crypto::ed25519_load_or_create(p.wstring());
+        g_identity = LoadIdentity(p.wstring());
+        if (!g_identity) throw std::runtime_error("identity");
         g_my_fingerprint = HexW(crypto::sha256(crypto::ed25519_public_raw(g_identity.get())), 8);
+
+        // 本地聊天记录的加密密钥：由身份私钥经 HKDF 派生（域分离），私钥不落盘于明文中
+        crypto::Bytes seed = crypto::ed25519_private_raw(g_identity.get());
+        g_storageKey = crypto::hkdf(seed, crypto::Bytes{}, "CHAT-v1 local storage key", 32);
+        crypto::wipe(seed);
     } catch (...) {
         MessageBoxW(NULL, L"身份密钥初始化失败", L"错误", MB_ICONERROR);
         return 1;
     }
 
-    // 载入历史聊天记录
-    LoadAllChats(0);
+    // 载入历史聊天记录与已固定的身份指纹（按本地身份指纹归档，不随服务器 ID 变化）
+    LoadAllChats();
+    {
+        std::lock_guard<std::mutex> lk(g_sess_mu);
+        LoadPins();
+    }
+
+    // --dump <文件>：导出已解密的聊天记录后退出（用于备份/自动化测试）
+    if (!g_dumpPath.empty()) {
+        std::wstring out;
+        for (const auto& kv : g_chats) {
+            for (const auto& m : kv.second) {
+                out += std::to_wstring(kv.first) + L"\t" + std::to_wstring(m.dir) + L"\t" + m.text + L"\n";
+            }
+        }
+        WriteFileBytes(g_dumpPath, WideToUtf8(out));
+        return 0;
+    }
 
     const wchar_t* CLASS_NAME = L"ChatWindowClass";
     WNDCLASSW wc = { };
@@ -993,7 +1185,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (!hMainWnd) return 0;
 
     ShowWindow(hMainWnd, nCmdShow);
+
+    // 自动选中最近一次会话，打开即可看到上次的聊天记录
+    {
+        int best = 0;
+        uint64_t bestTs = 0;
+        for (const auto& kv : g_chats) {
+            if (!kv.second.empty() && kv.second.back().ts >= bestTs) {
+                bestTs = kv.second.back().ts;
+                best = kv.first;
+            }
+        }
+        if (best > 0) {
+            g_activePeer = best;
+            SetWindowTextW(hTargetBox, std::to_wstring(best).c_str());
+        }
+    }
     RefreshSessionList();
+    RefreshChatView();
 
     // 首次连接 + 断线重连定时器
     g_connecting.store(true);

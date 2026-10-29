@@ -36,12 +36,17 @@ constexpr uint8_t  VERSION     = 1;
 constexpr uint32_t MAX_PAYLOAD = 1u << 20;   // 单帧上限 1 MiB，防内存耗尽
 constexpr uint32_t MAX_FRAME   = MAX_PAYLOAD; // 长度字段本身的最大合法值
 
+// 目标 ID 为 0 表示“发给服务器本身”（心跳等控制帧，不会被转发）
+constexpr int SERVER_ID = 0;
+
 // 消息类型
 enum MsgType : uint8_t {
     HS_INIT    = 0x01,   // A -> B  握手请求
     HS_RESP    = 0x02,   // B -> A  握手响应
     HS_CONFIRM = 0x03,   // A -> B  握手确认
     DATA       = 0x10,   // 加密聊天数据
+    PING       = 0x20,   // 客户端 -> 服务器  心跳
+    PONG       = 0x21,   // 服务器 -> 客户端  心跳应答
     SYSTEM     = 0xFF,   // 服务器通知（明文，仅用于提示）
 };
 
