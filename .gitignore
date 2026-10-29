@@ -25,3 +25,7 @@ history.txt
 
 # Office 打开文档时产生的临时锁文件
 ~$*
+
+# Python 缓存
+__pycache__/
+*.pyc
