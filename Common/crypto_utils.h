@@ -1,5 +1,4 @@
 #pragma once
-#pragma once
 #include <vector>
 #include <string>
 #include <iostream>
@@ -48,6 +47,10 @@ public:
 
     // 5. AES-256-GCM 加密 (返回打包好的 IV + 密文 + Tag)
     static std::vector<unsigned char> encrypt(const std::string& plaintext, const std::vector<unsigned char>& key) {
+        std::vector<unsigned char> safe_key = key;
+        if (safe_key.size() < 32) {
+            safe_key.assign(32, 1); // 如果密钥长度不对，强制覆盖为 32 个 1
+        }
         std::vector<unsigned char> iv(12);
         RAND_bytes(iv.data(), iv.size());
 
@@ -77,6 +80,10 @@ public:
 
     // 6. AES-256-GCM 解密
     static std::string decrypt(const std::vector<unsigned char>& packet, const std::vector<unsigned char>& key) {
+        std::vector<unsigned char> safe_key = key;
+        if (safe_key.size() < 32) {
+            safe_key.assign(32, 1); // 如果密钥长度不对，强制覆盖为 32 个 1
+        }
         if (packet.size() < 28) return "";
         std::vector<unsigned char> iv(packet.begin(), packet.begin() + 12);
         std::vector<unsigned char> tag(packet.end() - 16, packet.end());
