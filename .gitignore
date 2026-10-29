@@ -28,6 +28,10 @@ Tools/make_*.py
 Tools/build_reports_safe.py
 Tools/capture_shots.ps1
 
+# 个人报告与队内材料（仅本地保留）
+docs/专业程序设计报告-成员*.docx
+docs/两人分工与答辩材料.md
+
 # Office 打开文档时产生的临时锁文件
 ~$*
 
