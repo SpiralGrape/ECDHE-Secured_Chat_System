@@ -652,7 +652,7 @@ def text_figure(path, name, title, max_lines=None, fs=7.6, w=6.3):
     ax.add_patch(plt.Rectangle((1, 92.5), 98, 6.5, fc="#2d2d30", ec="none", zorder=2))
     ax.text(3.2, 95.7, title, fontsize=8.0, color="#cccccc", va="center", zorder=3,
             family=[CJK, MONO])
-    step = 89.5 / max(len(lines), 1)
+    step = 84.0 / max(len(lines), 1)
     for i, ln in enumerate(lines):
         color = "#d4d4d4"
         if "[OK]" in ln:
@@ -663,7 +663,7 @@ def text_figure(path, name, title, max_lines=None, fs=7.6, w=6.3):
             color = "#dcdcaa"
         elif "未找到" in ln:
             color = "#6ec07a"
-        ax.text(3.2, 89.0 - i * step, ln if ln else " ", fontsize=fs, color=color,
+        ax.text(3.2, 88.0 - i * step, ln if ln else " ", fontsize=fs, color=color,
                 va="top", ha="left", zorder=3, family=[MONO, CJK])
     save(fig, name)
 
