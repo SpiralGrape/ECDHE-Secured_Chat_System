@@ -101,6 +101,15 @@ Start-Sleep -Seconds 2
 [void][W32]::SendStr($info[2].Target, 0x000C, [IntPtr]::Zero, "1")
 [void][W32]::SendStr($info[2].Input,  0x000C, [IntPtr]::Zero, "ack-from-client-2")
 [void][W32]::Send($info[2].Wnd, 0x0111, [IntPtr]1, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 1200
+
+# 6b. 连发 10 条，跨越 REKEY_INTERVAL(8) 触发 DH 棘轮轮换
+for ($i = 0; $i -lt 10; $i++) {
+    [void][W32]::SendStr($info[1].Target, 0x000C, [IntPtr]::Zero, "2")
+    [void][W32]::SendStr($info[1].Input,  0x000C, [IntPtr]::Zero, "rekey-$i")
+    [void][W32]::Send($info[1].Wnd, 0x0111, [IntPtr]1, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 200
+}
 Start-Sleep -Seconds 2
 
 # 7. 聊天记录已加密存储：先关掉客户端，再用 --dump 导出解密后的明文进行校验
@@ -132,6 +141,7 @@ Write-Host "`n===== checks ====="
 if ($log12 -match "(?m)^1`t0`thello-from-client-1") { Write-Host "  [OK] client 2 decrypted message 1" } else { Write-Host "  [FAIL] client 2 did not get message 1" }
 if ($log21 -match "(?m)^2`t0`tack-from-client-2")   { Write-Host "  [OK] client 1 decrypted message 2" } else { Write-Host "  [FAIL] client 1 did not get message 2" }
 if ($log21 -match "(?m)^2`t1`thello-from-client-1") { Write-Host "  [OK] outgoing message persisted" } else { Write-Host "  [FAIL] outgoing message not persisted" }
+if ($log12 -match "(?m)^1`t0`trekey-9$") { Write-Host "  [OK] DH ratchet: 10 messages delivered after rekey" } else { Write-Host "  [FAIL] DH ratchet messages missing" }
 
 # 磁盘上的记录文件必须是密文（不应出现明文）
 $stored = Get-ChildItem -Path (Join-Path $PROF2 "chats") -Recurse -Filter "1.log" -ErrorAction SilentlyContinue |

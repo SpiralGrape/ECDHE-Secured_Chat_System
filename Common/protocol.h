@@ -44,6 +44,7 @@ enum MsgType : uint8_t {
     HS_INIT    = 0x01,   // A -> B  握手请求
     HS_RESP    = 0x02,   // B -> A  握手响应
     HS_CONFIRM = 0x03,   // A -> B  握手确认
+    REKEY      = 0x04,   // DH 棘轮轮换（在加密通道内传输）
     DATA       = 0x10,   // 加密聊天数据
     PING       = 0x20,   // 客户端 -> 服务器  心跳
     PONG       = 0x21,   // 服务器 -> 客户端  心跳应答

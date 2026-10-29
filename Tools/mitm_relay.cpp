@@ -143,8 +143,13 @@ static void ForwardData(Pair& p, bool senderIsInitiator, int from, int to, const
     securechat::SecureSession& enc = senderIsInitiator ? p.out : p.in;
 
     std::string plain, err;
-    if (!dec.Open(/*myId=*/to, /*peerId=*/from, body, plain, err)) {
+    bool isControl = false;
+    if (!dec.Open(/*myId=*/to, /*peerId=*/from, body, plain, isControl, err)) {
         Log("[MITM] 解密失败: " + err);
+        return;
+    }
+    if (isControl) {
+        Log("[MITM] 收到 DH 棘轮轮换帧，已在本地完成对应会话的密钥更新");
         return;
     }
 
@@ -154,12 +159,12 @@ static void ForwardData(Pair& p, bool senderIsInitiator, int from, int to, const
     Log("[抓包]   密文 " + std::to_string(ctLen) + " 字节，前 16 字节 " +
         Hex(ct, ctLen < 16 ? ctLen : 16));
 
-    Bytes out;
-    if (!enc.Seal(/*myId=*/from, /*peerId=*/to, plain, out, err)) {
+    std::vector<Bytes> frames;
+    if (!enc.Seal(/*myId=*/from, /*peerId=*/to, plain, frames, err)) {
         Log("[MITM] 重新加密失败: " + err);
         return;
     }
-    SendTo(to, from, out);
+    for (const auto& f : frames) SendTo(to, from, f);
 }
 
 static void Route(int from, int to, const Bytes& body) {
@@ -224,7 +229,7 @@ static void Route(int from, int to, const Bytes& body) {
         return;
     }
 
-    if (type == proto::DATA) {
+    if (type == proto::DATA || type == proto::REKEY) {
         std::lock_guard<std::mutex> lk(g_pairs_mu);
 
         Pair* p = nullptr;

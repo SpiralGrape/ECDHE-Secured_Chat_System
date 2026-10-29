@@ -567,13 +567,14 @@ static bool SendRaw(const Bytes& frame) {
 
 // ======================================================= 会话（需持锁） ====
 static void LockedSendChat(int peer, PeerSession& ps, const std::string& text) {
-    Bytes payload;
+    std::vector<Bytes> frames;
     std::string err;
-    if (!ps.crypto.Seal(my_client_id, peer, text, payload, err)) {
+    if (!ps.crypto.Seal(my_client_id, peer, text, frames, err)) {
         PostStatus(Utf8ToWide(err), true);
         return;
     }
-    SendRaw(MakeFrame(peer, payload));
+    // 可能依次包含 REKEY（DH 棘轮轮换）与 DATA 两帧
+    for (const auto& f : frames) SendRaw(MakeFrame(peer, f));
 }
 
 static void LockedFlushOutbox(int peer, PeerSession& ps) {
@@ -708,11 +709,13 @@ static void HandleData(int sender, const Bytes& body) {
     if (!ps.crypto.established()) return;
 
     std::string plain, err;
-    if (!ps.crypto.Open(my_client_id, sender, body, plain, err)) {
+    bool isControl = false;
+    if (!ps.crypto.Open(my_client_id, sender, body, plain, isControl, err)) {
         PostChat(sender, 2, L"消息校验失败：" + Utf8ToWide(err) + L"，已重置会话");
         g_sessions.erase(it);
         return;
     }
+    if (isControl) return;   // DH 棘轮轮换帧，无需展示
 
     PostChat(sender, 0, Utf8ToWide(plain));
 }
@@ -794,6 +797,7 @@ static void NetworkThread() {
             case proto::HS_RESP:    HandleResp(sender, body);     break;
             case proto::HS_CONFIRM: HandleConfirm(sender, body);  break;
             case proto::DATA:       HandleData(sender, body);     break;
+            case proto::REKEY:      HandleData(sender, body);     break;   // DH 棘轮轮换
             default: break;
             }
         }

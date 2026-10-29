@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <deque>
 #include <string>
+#include <vector>
 
 #include "crypto_utils.h"
 #include "protocol.h"
@@ -62,8 +63,13 @@ public:
     bool HandleConfirm(const Bytes& in, std::string& err);
 
     // -------------------------------------------------------- 记录层 ------
-    bool Seal(int myId, int peerId, const std::string& plain, Bytes& out, std::string& err);
-    bool Open(int myId, int peerId, const Bytes& in, std::string& plain, std::string& err);
+    // out 依次包含「可选的 REKEY 控制帧」与「DATA 帧」，调用方按序发送即可
+    bool Seal(int myId, int peerId, const std::string& plain,
+              std::vector<Bytes>& out, std::string& err);
+
+    // isControl = true 表示这是一帧 REKEY（已在本端完成棘轮轮换），无需展示给用户
+    bool Open(int myId, int peerId, const Bytes& in,
+              std::string& plain, bool& isControl, std::string& err);
 
 private:
     static Bytes TranscriptHash(const Bytes& a, const Bytes& b) {
@@ -72,6 +78,13 @@ private:
 
     bool Derive(bool initiator, std::string& err);
     void ComputeSas();
+
+    // ---- DH 棘轮 ----
+    // 用当前链密钥加密一条记录（推进 send_chain_）
+    bool BuildRecord(uint8_t type, const Bytes& plain, int myId, int peerId,
+                     Bytes& out, std::string& err);
+    // 用 DH 输出更新根密钥，并重置双向链密钥
+    bool ApplyRatchet(const Bytes& dhOut, std::string& err);
 
     State    state_ = State::None;
     uint64_t sid_ = 0;
@@ -85,6 +98,16 @@ private:
     uint64_t send_seq_ = 0, recv_seq_ = 0;
 
     std::string fingerprint_, sas_;
+
+    // ---- DH 棘轮状态 ----
+    static constexpr int REKEY_INTERVAL = 8;   // 每发送 8 条消息轮换一次 DH 密钥
+
+    bool is_initiator_ = false;
+    crypto::Bytes root_key_;                   // 根密钥（每次轮换更新）
+    crypto::PkeyPtr dh_self_;                  // 本端当前棘轮私钥（旧钥轮换后立刻销毁）
+    crypto::Bytes dh_self_pub_;
+    crypto::Bytes dh_peer_pub_;                // 对端当前棘轮公钥
+    int send_since_rekey_ = 0;
 };
 
 // ============================================================ 握手 ========
@@ -293,13 +316,22 @@ inline bool SecureSession::Derive(bool initiator, std::string& err) {
             }
         }
 
+        // ---- 初始化 DH 棘轮 ----
+        // 必须在 secret 被擦除之前派生根密钥；
+        // 握手阶段的双向临时密钥作为“初始棘轮密钥”（对端公钥已知，
+        // 首次轮换后本端旧私钥即被销毁）。
+        root_key_         = crypto::hkdf(secret, Bytes{}, "root key", 32);
+        is_initiator_     = initiator;
+        dh_self_          = std::move(eph_);
+        dh_self_pub_      = my_pub_;
+        dh_peer_pub_      = peer_pub_;
+        send_since_rekey_ = 0;
+
         crypto::wipe(z);
         crypto::wipe(secret);
         crypto::wipe(c_i2r);
         crypto::wipe(c_r2i);
 
-        // 前向保密关键：临时私钥用完即毁
-        eph_.reset();
         return true;
     } catch (std::exception& e) {
         err = e.what();
@@ -322,21 +354,21 @@ inline void SecureSession::ComputeSas() {
 }
 
 // ============================================================ 记录层 ======
-inline bool SecureSession::Seal(int myId, int peerId, const std::string& plain,
-                                Bytes& out, std::string& err) {
-    if (state_ != State::Established) { err = "会话未建立"; return false; }
-
+// 用当前链密钥加密一条记录（推进 send_chain_），type 可为 DATA 或 REKEY
+inline bool SecureSession::BuildRecord(uint8_t type, const Bytes& plain, int myId, int peerId,
+                                       Bytes& out, std::string& err) {
     try {
         Bytes msg_key = crypto::hkdf(send_chain_, Bytes{}, "message key", 32);
         Bytes nonce   = crypto::hkdf(send_chain_, Bytes{}, "message iv", 12);
         Bytes next    = crypto::hkdf(send_chain_, Bytes{}, "chain next", 32);
 
-        Bytes aad = proto::make_aad(proto::DATA, sid_, send_seq_, myId, peerId);
-        Bytes ct  = crypto::aead_encrypt(msg_key, nonce, plain, aad);
+        Bytes aad = proto::make_aad(type, sid_, send_seq_, myId, peerId);
+        std::string p(plain.begin(), plain.end());
+        Bytes ct = crypto::aead_encrypt(msg_key, nonce, p, aad);
 
         out.clear();
         out.push_back(proto::VERSION);
-        out.push_back(proto::DATA);
+        out.push_back(type);
         proto::append_u64(out, sid_);
         proto::append_u64(out, send_seq_);
         proto::append(out, ct);
@@ -354,15 +386,82 @@ inline bool SecureSession::Seal(int myId, int peerId, const std::string& plain,
     }
 }
 
+// DH 棘轮：用 DH 输出更新根密钥，并重置双向链密钥
+inline bool SecureSession::ApplyRatchet(const Bytes& dhOut, std::string& err) {
+    try {
+        // root' = HKDF(salt = root, ikm = DH) —— 根密钥与实际 DH 输出绑定
+        root_key_ = crypto::hkdf(dhOut, root_key_, "CHAT-v1 DH ratchet root", 32);
+
+        Bytes c_i2r = crypto::hkdf(root_key_, Bytes{}, "ratchet chain initiator->responder", 32);
+        Bytes c_r2i = crypto::hkdf(root_key_, Bytes{}, "ratchet chain responder->initiator", 32);
+
+        crypto::wipe(send_chain_);
+        crypto::wipe(recv_chain_);
+        send_chain_ = is_initiator_ ? c_i2r : c_r2i;
+        recv_chain_ = is_initiator_ ? c_r2i : c_i2r;
+
+        crypto::wipe(c_i2r);
+        crypto::wipe(c_r2i);
+        return true;
+    } catch (std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
+inline bool SecureSession::Seal(int myId, int peerId, const std::string& plain,
+                                std::vector<Bytes>& out, std::string& err) {
+    if (state_ != State::Established) { err = "会话未建立"; return false; }
+    out.clear();
+
+    // 周期性 DH 棘轮：每 REKEY_INTERVAL 条消息轮换一次本端密钥
+    if (send_since_rekey_ >= REKEY_INTERVAL) {
+        try {
+            crypto::PkeyPtr fresh = crypto::x25519_generate();
+            Bytes freshPub = crypto::x25519_public_raw(fresh.get());
+
+            // 1) 用【旧链】加密 REKEY 帧（对端先用旧链解密，再轮换）
+            Bytes rekeyRecord;
+            if (!BuildRecord(proto::REKEY, freshPub, myId, peerId, rekeyRecord, err)) return false;
+            out.push_back(rekeyRecord);
+
+            // 2) Z = DH(新私钥, 对端当前棘轮公钥) → 更新根密钥与链
+            crypto::PkeyPtr peer = crypto::x25519_from_public_raw(dh_peer_pub_.data(), dh_peer_pub_.size());
+            Bytes z = crypto::x25519_shared(fresh.get(), peer.get());
+            bool ok = ApplyRatchet(z, err);
+            crypto::wipe(z);
+            if (!ok) return false;
+
+            // 3) 轮换：旧私钥被覆盖，历史 DH 输出无法再计算（后向恢复）
+            dh_self_     = std::move(fresh);
+            dh_self_pub_ = freshPub;
+            send_since_rekey_ = 0;
+        } catch (std::exception& e) {
+            err = e.what();
+            return false;
+        }
+    }
+
+    Bytes record;
+    Bytes body(plain.begin(), plain.end());
+    if (!BuildRecord(proto::DATA, body, myId, peerId, record, err)) return false;
+    out.push_back(record);
+    send_since_rekey_++;
+    return true;
+}
+
 inline bool SecureSession::Open(int myId, int peerId, const Bytes& in,
-                                std::string& plain, std::string& err) {
+                                std::string& plain, bool& isControl, std::string& err) {
+    isControl = false;
     if (state_ != State::Established) { err = "会话未建立"; return false; }
     if (in.size() < proto::DATA_MIN) { err = "DATA 长度非法"; return false; }
 
-    const uint64_t sid = proto::get_u64(in.data() + 2);
-    const uint64_t seq = proto::get_u64(in.data() + 10);
+    const uint8_t  type = in[1];
+    const uint64_t sid  = proto::get_u64(in.data() + 2);
+    const uint64_t seq  = proto::get_u64(in.data() + 10);
     if (sid != sid_) { err = "会话号不匹配"; return false; }
     if (seq != recv_seq_) { err = "序号失步或重放"; return false; }
+    if (type != proto::DATA && type != proto::REKEY) { err = "未知记录类型"; return false; }
 
     Bytes ct = proto::slice(in, proto::DATA_HEADER, in.size() - proto::DATA_HEADER);
 
@@ -371,7 +470,7 @@ inline bool SecureSession::Open(int myId, int peerId, const Bytes& in,
         Bytes nonce   = crypto::hkdf(recv_chain_, Bytes{}, "message iv", 12);
         Bytes next    = crypto::hkdf(recv_chain_, Bytes{}, "chain next", 32);
 
-        Bytes aad = proto::make_aad(proto::DATA, sid, seq, peerId, myId);
+        Bytes aad = proto::make_aad(type, sid, seq, peerId, myId);
         bool ok = crypto::aead_decrypt(msg_key, nonce, ct, aad, plain);
 
         crypto::wipe(msg_key);
@@ -383,10 +482,29 @@ inline bool SecureSession::Open(int myId, int peerId, const Bytes& in,
             return false;
         }
 
+        // 先用旧链推进接收棘轮
         crypto::wipe(recv_chain_);
         recv_chain_ = next;
         crypto::wipe(next);
         recv_seq_++;
+
+        // ---- REKEY：对端轮换了 DH 密钥，本端同步更新根密钥与链 ----
+        if (type == proto::REKEY) {
+            if (plain.size() != proto::X25519_LEN) { err = "REKEY 载荷长度非法"; return false; }
+            Bytes newPeerPub(plain.begin(), plain.end());
+
+            crypto::PkeyPtr peer = crypto::x25519_from_public_raw(newPeerPub.data(), newPeerPub.size());
+            Bytes z = crypto::x25519_shared(dh_self_.get(), peer.get());
+            bool ok2 = ApplyRatchet(z, err);
+            crypto::wipe(z);
+            if (!ok2) return false;
+
+            dh_peer_pub_ = newPeerPub;
+            plain.clear();
+            isControl = true;
+            return true;
+        }
+
         return true;
     } catch (std::exception& e) {
         err = e.what();

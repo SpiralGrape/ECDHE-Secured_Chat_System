@@ -13,6 +13,7 @@
 
 #include "crypto_utils.h"
 #include "protocol.h"
+#include "secure_session.h"
 
 using crypto::Bytes;
 
@@ -166,6 +167,66 @@ int main() {
         // 当前链密钥无法还原第 1 条消息的密钥 → 消息级前向保密
         Bytes nowKey = crypto::hkdf(sSend, Bytes{}, "message key", 32);
         Check(nowKey != oldKey, "当前链密钥无法恢复历史消息密钥");
+    }
+
+    // ------------------------------------------------ 6. 协议级：DH 棘轮 ----
+    std::printf("\n[6] DH 棘轮（协议级完整握手 + 自动轮换）\n");
+    {
+        auto idA = crypto::ed25519_generate();
+        auto idB = crypto::ed25519_generate();
+        securechat::SecureSession a, b;
+        std::string err;
+
+        crypto::Bytes init, resp;
+        Check(a.BuildInit(crypto::random_u64(), 1, 2, idA.get(), init, err), "A 生成 INIT");
+        Check(b.HandleInit(init, 2, 1, idB.get(), resp, err), "B 处理 INIT 并生成 RESP");
+
+        crypto::Bytes confirm;
+        Check(a.HandleResp(resp, 1, 2, confirm, err), "A 处理 RESP 并生成 CONFIRM");
+        Check(b.HandleConfirm(confirm, err), "B 校验 CONFIRM");
+
+        Check(a.established() && b.established(), "双方会话均建立");
+        Check(a.sas() == b.sas(), "双方安全码一致（正常握手）");
+
+        bool allOk = true;
+        int  rekeys = 0;
+
+        // 先让 B 回一条（模拟真实场景：先有反向消息）
+        {
+            std::vector<crypto::Bytes> f2;
+            std::string p2; bool c2 = false;
+            if (!b.Seal(2, 1, "ack", f2, err)) allOk = false;
+            for (const auto& f : f2)
+                if (!a.Open(1, 2, f, p2, c2, err)) { allOk = false; }
+        }
+
+        for (int i = 0; i < 20; ++i) {
+            std::string msg = "msg#" + std::to_string(i);
+            std::vector<crypto::Bytes> frames;
+            if (!a.Seal(1, 2, msg, frames, err)) { allOk = false; break; }
+
+            for (const auto& f : frames) {
+                if (f.size() > 1 && f[1] == proto::REKEY) ++rekeys;
+                std::string plain;
+                bool ctrl = false;
+                if (!b.Open(2, 1, f, plain, ctrl, err)) { allOk = false; break; }
+                if (!ctrl && plain != msg) allOk = false;
+            }
+            if (!allOk) break;
+        }
+        Check(allOk, "20 条消息 + 自动 DH 轮换后双方仍同步");
+        Check(rekeys >= 2, "期间确实触发了 DH 密钥轮换（向后恢复的前提）");
+
+        // 反向方向也必须同步（轮换后双向链都已重置）
+        std::vector<crypto::Bytes> frames;
+        bool ok = b.Seal(2, 1, "reply", frames, err);
+        std::string plain;
+        bool ctrl = false;
+        if (ok) {
+            for (const auto& f : frames)
+                if (!a.Open(1, 2, f, plain, ctrl, err)) ok = false;
+        }
+        Check(ok && plain == "reply", "轮换后反方向消息仍可正确解密");
     }
 
     // --------------------------------------------------------- 结果 ------
