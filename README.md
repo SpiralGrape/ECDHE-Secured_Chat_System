@@ -313,7 +313,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\mitm_demo.ps1
 | `docs/专业程序设计报告-成员A-密码协议方向.docx` | 成员 A 的报告（27~28 页 / 19 图 / 24 表）：公共章节 + 握手协议与密钥调度 / 密钥棘轮 / 安全性分析 |
 | `docs/专业程序设计报告-成员B-网络与工程化方向.docx` | 成员 B 的报告（27~28 页 / 19 图 / 24 表）：公共章节 + 网络与并发 / 客户端工程实现 / 测试工程与工具链 |
 | `docs/专业程序设计报告-基于ECDHE的前向保密聊天工具.docx` | 合并版报告（备查，非提交件） |
-| `docs/figures/` | 18 张报告插图（用例图、架构图、帧格式、握手时序、密钥调度、两层棘轮、并发模型、状态机、存储加密链、测试统计等） |
+| `docs/figures/` | 14 张报告插图（用例图、架构图、帧格式、握手时序、密钥调度、两层棘轮、并发模型、状态机、存储加密链、中间人拓扑、测试统计图与两道真实运行输出） |
 | `Tools/make_reports.py` | 生成成员 A / 成员 B 两份报告（需 `pip install python-docx`） |
 | `Tools/make_figures.py` | 生成 `docs/figures/` 下的全部插图（需 `pip install matplotlib`） |
 | `Tools/capture_shots.ps1` | 抓取真实运行截图（正常会话、离线提示、断线重连）与密文样本 |
