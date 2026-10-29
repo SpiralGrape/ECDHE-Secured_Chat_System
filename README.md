@@ -305,8 +305,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\mitm_demo.ps1
 |---|---|
 | `docs/report.md` | 设计报告（Markdown）：威胁模型、协议设计、17 个真实问题的排查记录、测试与演示方案 |
 | `docs/两人分工与答辩材料.md` | 两人小组分工、完整测试用例表、8 分钟答辩脚本、论文素材（局限性与展望） |
-| `docs/专业程序设计报告-基于ECDHE的前向保密聊天工具.docx` | 按课程模板排版的设计报告（封面 + 七章 + 图表） |
-| `Tools/make_report_docx.py` | 从模板生成上述 docx（需 `pip install python-docx`） |
+| `docs/专业程序设计报告-成员A-密码协议方向.docx` | 成员 A 的报告：公共章节 + 握手协议/密钥棘轮/安全性分析 |
+| `docs/专业程序设计报告-成员B-网络与工程化方向.docx` | 成员 B 的报告：公共章节 + 网络并发/客户端实现/测试工程 |
+| `docs/专业程序设计报告-基于ECDHE的前向保密聊天工具.docx` | 合并版报告（备查，非提交件） |
+| `Tools/make_two_reports.py` | 生成成员 A / 成员 B 两份报告（需 `pip install python-docx`） |
+| `Tools/make_report_docx.py` | 生成合并版报告 |
 
 重新生成 docx：
 
