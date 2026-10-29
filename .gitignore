@@ -22,3 +22,6 @@ CMakeFiles/
 # 本机运行产物
 *.pem
 history.txt
+
+# Office 打开文档时产生的临时锁文件
+~$*
