@@ -132,7 +132,7 @@ Start-Sleep -Seconds 2
 # 5. 截图两个客户端（证明它们认为会话正常）
 function Grab([IntPtr]$h) {
     [void][M32]::ShowWindow($h, 9)
-    [void][M32]::SetWindowPos($h, [IntPtr]::Zero, 40, 40, 900, 620, 0x0040)
+    [void][M32]::SetWindowPos($h, [IntPtr]::Zero, 40, 40, 760, 560, 0x0040)
     [void][M32]::SetForegroundWindow($h)
     Start-Sleep -Milliseconds 600
     $r = New-Object M32+RECT
@@ -149,7 +149,7 @@ function Capture([IntPtr]$h, [string]$path, [string]$statusPath) {
     $bmp = Grab $h
     $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
     if ($statusPath) {
-        $crop = 56
+        $crop = 52
         $strip = New-Object System.Drawing.Bitmap $bmp.Width, $crop
         $g2 = [System.Drawing.Graphics]::FromImage($strip)
         $dst = New-Object System.Drawing.Rectangle 0, 0, $bmp.Width, $crop

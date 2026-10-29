@@ -89,7 +89,7 @@ New-Item -ItemType Directory -Force -Path $OUT | Out-Null
 # 固定窗口尺寸并置前；只 PrintWindow 一次，全图与状态栏裁剪复用同一张位图
 function Shot([IntPtr]$h, [string]$full, [string]$status, [int]$x = 60, [int]$y = 60) {
     [void][C32]::ShowWindow($h, 9)
-    [void][C32]::SetWindowPos($h, [IntPtr]::Zero, $x, $y, 900, 620, 0x0040)
+    [void][C32]::SetWindowPos($h, [IntPtr]::Zero, $x, $y, 760, 560, 0x0040)
     [void][C32]::SetForegroundWindow($h)
     Start-Sleep -Milliseconds 900
 
@@ -103,7 +103,7 @@ function Shot([IntPtr]$h, [string]$full, [string]$status, [int]$x = 60, [int]$y 
     $g.ReleaseHdc($hdc)
     if ($full) { $bmp.Save($full, [System.Drawing.Imaging.ImageFormat]::Png); Write-Host "  saved $full" }
     if ($status) {
-        $crop = 58
+        $crop = 52
         $strip = New-Object System.Drawing.Bitmap $w, $crop
         $g2 = [System.Drawing.Graphics]::FromImage($strip)
         $dst = New-Object System.Drawing.Rectangle 0, 0, $w, $crop

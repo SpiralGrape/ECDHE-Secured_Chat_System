@@ -35,10 +35,34 @@ RED = ("#fdecea", "#c0392b")
 GRAY = ("#f3f5f8", "#8290a0")
 PURPLE = ("#f3eefb", "#6f42c1")
 
+# 记录“文字-方框”对，在 save() 时检查文字是否溢出方框
+_CHECK = []
+
+
+def _check(name):
+    """打印溢出告警（文字超出方框），用于逐条修正排版。"""
+    fig = plt.gcf()
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    for p, t in _CHECK:
+        pb = p.get_window_extent(r)
+        tb = t.get_window_extent(r)
+        if tb.width > pb.width - 1.5 or tb.height > pb.height - 1.5:
+            print("    !! OVERFLOW %-20s %-28s text=%4.0f box=%4.0f"
+                  % (name, repr(t.get_text())[:28], tb.width, pb.width))
+    _CHECK.clear()
+
+
+# 插图按“最终印刷尺寸”绘制：画布宽度接近插入宽度（16 cm ≈ 6.3 in），
+# 这样图中的 8~9pt 文字印到纸上仍是 8~9pt，不会因为缩小插入而变得看不清。
+FIG_K = 0.60
+DPI = 220
+
 
 # ------------------------------------------------------------------ 基础 -----
-def canvas(w, h):
-    fig = plt.figure(figsize=(w, h), dpi=200)
+def canvas(w, h, k=None):
+    k = FIG_K if k is None else k
+    fig = plt.figure(figsize=(w * k, h * k), dpi=DPI)
     ax = fig.add_axes([0.004, 0.004, 0.992, 0.992])
     ax.set_xlim(0, 100)
     ax.set_ylim(0, 100)
@@ -49,13 +73,16 @@ def canvas(w, h):
 def box(ax, x, y, w, h, text, colors=BLUE, fs=9, bold=False, ls="-", lw=1.2,
         tc=INK, r=1.4, align="center", z=2, alpha=1.0):
     fc, ec = colors
-    ax.add_patch(FancyBboxPatch((x, y), w, h,
-                                boxstyle=f"round,pad=0.35,rounding_size={r}",
-                                fc=fc, ec=ec, lw=lw, ls=ls, zorder=z, alpha=alpha))
+    p = FancyBboxPatch((x, y), w, h,
+                       boxstyle=f"round,pad=0.35,rounding_size={r}",
+                       fc=fc, ec=ec, lw=lw, ls=ls, zorder=z, alpha=alpha)
+    ax.add_patch(p)
     ha = {"center": "center", "left": "left"}[align]
     tx = x + w / 2 if align == "center" else x + 1.2
-    ax.text(tx, y + h / 2, text, ha=ha, va="center", fontsize=fs, color=tc,
-            fontweight="bold" if bold else "normal", zorder=z + 1, linespacing=1.45)
+    t = ax.text(tx, y + h / 2, text, ha=ha, va="center", fontsize=fs, color=tc,
+                fontweight="bold" if bold else "normal", zorder=z + 1, linespacing=1.45)
+    _CHECK.append((p, t))
+    return p
 
 
 def arrow(ax, p1, p2, color="#2f6db0", lw=1.4, style="-|>", ls="-", rad=0.0,
@@ -78,8 +105,9 @@ def note(ax, x, y, text, fs=8, color=INK, ha="center", style="normal"):
 
 def save(fig, name):
     os.makedirs(DOCS, exist_ok=True)
+    _check(name)
     p = os.path.join(DOCS, name)
-    fig.savefig(p, dpi=200, facecolor="white")
+    fig.savefig(p, dpi=DPI, facecolor="white")
     plt.close(fig)
     print("  fig:", name, os.path.getsize(p))
 
@@ -131,11 +159,11 @@ def client_block(ax, x0, title, sub):
     box(ax, x0, 4, 28, 92, "", (("#f7fafd"), "#1f4e79"), lw=1.6)
     note(ax, x0 + 14, 91, title, 9.5, "#1f4e79")
     note(ax, x0 + 14, 86.5, sub, 7.6, "#5b7086")
-    box(ax, x0 + 2, 72, 24, 11, "界面层\n会话列表 / 聊天区 / 状态栏", BLUE, 8)
-    box(ax, x0 + 2, 57, 24, 11, "会话层 SecureSession\n握手 · 棘轮 · 安全码", PURPLE, 8)
-    box(ax, x0 + 2, 42, 24, 11, "密码学层 crypto_utils\nX25519 / HKDF / AES-GCM / Ed25519", GREEN, 7.4)
-    box(ax, x0 + 2, 26, 24, 12, "存储层\nidentity.pem(DPAPI) + 加密聊天记录", AMBER, 7.4)
-    box(ax, x0 + 2, 8, 24, 12, "网络线程\n心跳 PING / 15 秒超时 / 自动重连", GRAY, 7.6)
+    box(ax, x0 + 2, 72, 24, 11, "界面层\n会话列表 / 聊天区 / 状态栏", BLUE, 7.6)
+    box(ax, x0 + 2, 57, 24, 11, "会话层 SecureSession\n握手 · 棘轮 · 安全码", PURPLE, 7.6)
+    box(ax, x0 + 2, 41, 24, 13, "密码学层 crypto_utils\nX25519 / HKDF\nAES-GCM / Ed25519", GREEN, 7.2)
+    box(ax, x0 + 2, 25, 24, 13, "存储层\nidentity.pem (DPAPI)\n加密聊天记录", AMBER, 7.2)
+    box(ax, x0 + 2, 7, 24, 13, "网络线程\n心跳 / 15 秒超时\n自动重连", GRAY, 7.2)
 
 
 def fig_arch():
@@ -146,17 +174,17 @@ def fig_arch():
     ax.add_patch(FancyBboxPatch((34, 16), 32, 66, boxstyle="round,pad=0.5,rounding_size=2",
                                 fc="#fdfbf7", ec="#c9861a", lw=1.5, ls=(0, (5, 3)), zorder=1))
     note(ax, 50, 84, "不可信中继（服务器不持有任何密钥）", 9.2, "#a86a12")
-    box(ax, 36.5, 60, 27, 14, "按目标 ID 转发密文帧\n不解析、不解密、不落盘", AMBER, 8.4)
-    box(ax, 36.5, 43, 27, 14, "心跳应答 PONG\n60 秒无活动即回收该 ID", AMBER, 8.4)
-    box(ax, 36.5, 26, 27, 14, "帧长上下界检查\n4 字节 ≤ len ≤ 1 MiB", AMBER, 8.4)
+    box(ax, 36.5, 60, 27, 14, "按目标 ID 转发密文帧\n不解析、不解密", AMBER, 7.6)
+    box(ax, 36.5, 43, 27, 14, "心跳应答 PONG\n60 秒无活动回收 ID", AMBER, 7.6)
+    box(ax, 36.5, 26, 27, 14, "帧长检查\n4 B ≤ len ≤ 1 MiB", AMBER, 7.6)
 
     arrow(ax, (30, 52), (36.5, 52), label="密文帧", fs=8)
     arrow(ax, (36.5, 44), (30, 44), label="密文帧", fs=8, dy=-2.4)
     arrow(ax, (63.5, 52), (70.5, 52), label="密文帧", fs=8)
     arrow(ax, (70.5, 44), (63.5, 44), label="密文帧", fs=8, dy=-2.4)
 
-    note(ax, 50, 10, "服务器被攻破也只能得到密文与「谁在何时发给谁」的元数据；\n"
-                     "任何篡改都会因 AAD 认证失败而被接收端丢弃", 8.2, "#7a4b0c")
+    note(ax, 50, 10, "服务器被攻破也只能得到密文与元数据；任何篡改都会因 AAD 认证失败而被丢弃",
+         7.6, "#7a4b0c")
     save(fig, "fig_arch.png")
 
 
@@ -217,12 +245,12 @@ def fig_frame():
 
 # ------------------------------------------------------- 4. 握手时序 --------
 def fig_handshake():
-    fig, ax = canvas(10.0, 7.4)
+    fig, ax = canvas(10.0, 8.2)
     xa, xb = 13, 87
     for x in (xa, xb):
         ax.plot([x, x], [9, 90], color="#5a6b7c", lw=1.1, ls=(0, (6, 3)), zorder=1)
-    box(ax, xa - 9, 90, 18, 7, "发起方 A\n（消息发送者）", BLUE, 8.4)
-    box(ax, xb - 9, 90, 18, 7, "响应方 B\n（消息接收者）", GREEN, 8.4)
+    box(ax, xa - 10, 88, 20, 9, "发起方 A（发送方）", BLUE, 8.2)
+    box(ax, xb - 10, 88, 20, 9, "响应方 B（接收方）", GREEN, 8.2)
     ax.add_patch(plt.Rectangle((46, 34), 8, 56, fc="#fdfbf7", ec="#c9861a",
                                lw=1.0, ls=(0, (4, 3)), zorder=0))
     ax.text(50, 62, "中继服务器：原样转发，无密钥", ha="center", va="center",
@@ -237,22 +265,22 @@ def fig_handshake():
     arrow(ax, (xa, 47), (xb, 47), label="③ HS_CONFIRM（42 B）：MAC_A", fs=8, dy=3.2)
     note(ax, xb - 16, 39, "验 MAC_A → 双方进入 Established", 8, "#2e8b57")
 
-    box(ax, 12, 22, 76, 8,
-        "双方状态栏显示：6 位安全码（SAS）+ 会话密钥指纹　→　这是唯一能发现中间人的手段",
-        (("#eef7f0"), "#2e8b57"), 8.6, bold=True)
+    box(ax, 12, 22, 76, 9,
+        "双方状态栏显示 6 位安全码 + 会话密钥指纹\n这是唯一能发现中间人的手段",
+        (("#eef7f0"), "#2e8b57"), 7.8, bold=True)
     box(ax, 12, 10, 76, 8,
-        "此后每条消息：消息密钥棘轮（HKDF 单向推进）；每发送 8 条消息：DH 棘轮（REKEY 加密帧）",
-        PURPLE, 8.4)
+        "此后每条消息：消息密钥棘轮；每 8 条：DH 棘轮（REKEY 帧）",
+        PURPLE, 7.8)
     save(fig, "fig_handshake.png")
 
 
 # ------------------------------------------------------- 5. 密钥调度 --------
 def fig_kdf():
-    fig, ax = canvas(9.8, 6.6)
-    box(ax, 12, 88, 76, 8, "Z = X25519(本端临时私钥, 对端临时公钥)　—— 32 字节共享秘密", GREEN, 8.6, bold=True)
-    box(ax, 6, 74, 88, 9,
-        "secret = HKDF-SHA256(ikm = Z, salt = nonceA ‖ nonceB, info = “CHAT-v1 ECDHE X25519”, 32 B)",
-        BLUE, 8.2, bold=True)
+    fig, ax = canvas(9.8, 7.2)
+    box(ax, 12, 88, 76, 8, "Z = X25519(本端临时私钥, 对端临时公钥)　—— 32 字节共享秘密", GREEN, 8.2, bold=True)
+    box(ax, 4, 74, 92, 9,
+        "secret = HKDF-SHA256(Z, salt = nonceA‖nonceB, info = “CHAT-v1 ECDHE X25519”)",
+        BLUE, 7.6, bold=True)
     arrow(ax, (50, 88), (50, 83))
     arrow(ax, (50, 74), (50, 68))
 
@@ -309,26 +337,26 @@ def fig_msg_ratchet():
 
 # ----------------------------------------------------- 7. DH 棘轮 ----------
 def fig_dh_ratchet():
-    fig, ax = canvas(10.0, 4.8)
-    box(ax, 3, 72, 26, 12, "root$_k$\n根密钥", (("#f3eefb"), "#6f42c1"), 9, bold=True)
-    box(ax, 3, 46, 26, 12, "DH$_k$ = X25519\n(新私钥, 对端棘轮公钥)", GREEN, 8)
-    box(ax, 37, 58, 24, 14, "HKDF\nsalt = root$_k$\nikm = DH$_k$", BLUE, 8.2)
+    fig, ax = canvas(10.0, 6.2)
+    box(ax, 3, 72, 26, 12, "root$_k$\n根密钥", (("#f3eefb"), "#6f42c1"), 8.4, bold=True)
+    box(ax, 3, 46, 26, 12, "DH$_k$ = X25519\n(新私钥, 对端公钥)", GREEN, 7.4)
+    box(ax, 37, 57, 24, 16, "HKDF\nsalt=root$_k$\nikm=DH$_k$", BLUE, 7.4)
     arrow(ax, (16, 72), (37, 68.5), lw=1.2)
     arrow(ax, (16, 58), (37, 61.5), lw=1.2, color="#2e8b57")
 
-    box(ax, 67, 72, 30, 12, "root$_{k+1}$（新根密钥）", (("#f3eefb"), "#6f42c1"), 9, bold=True)
+    box(ax, 67, 72, 30, 12, "root$_{k+1}$（新根密钥）", (("#f3eefb"), "#6f42c1"), 8.4, bold=True)
     arrow(ax, (61, 65), (67, 76), lw=1.3)
 
-    box(ax, 67, 44, 30, 10, "重建双向链密钥\nchainI2R / chainR2I", AMBER, 8.2)
-    arrow(ax, (82, 72), (82, 54), lw=1.3, color="#c9861a")
-    box(ax, 67, 26, 30, 10, "旧私钥、旧链密钥\n立即销毁（OVERWRITE）", RED, 8.2)
-    arrow(ax, (82, 44), (82, 36), lw=1.2, color="#c0392b")
+    box(ax, 67, 44, 30, 11, "重建双向链密钥\nchainI2R / chainR2I", AMBER, 7.4)
+    arrow(ax, (82, 72), (82, 55), lw=1.3, color="#c9861a")
+    box(ax, 67, 26, 30, 12, "旧私钥、旧链密钥\n立即销毁", RED, 7.4)
+    arrow(ax, (82, 44), (82, 38), lw=1.2, color="#c0392b")
 
-    note(ax, 16, 24, "触发条件", 8.6, "#31414f", style="italic")
-    box(ax, 3, 8, 26, 12, "每发送 8 条消息\n（REKEY_INTERVAL）", (("#fdf3e3"), "#c9861a"), 8)
-    box(ax, 33, 8, 30, 20,
-        "轮换过程：\n① 用旧链加密一条 REKEY 帧（携带新公钥）\n② 双方各自算 DH 并更新根密钥\n"
-        "③ 用新根密钥重建双向链\n④ 发送方销毁旧私钥", AMBER, 7.6)
+    note(ax, 16, 24, "触发条件", 8.2, "#31414f", style="italic")
+    box(ax, 3, 8, 26, 12, "每发送 8 条消息\n（REKEY_INTERVAL）", (("#fdf3e3"), "#c9861a"), 7.4)
+    box(ax, 33, 6, 32, 26,
+        "轮换过程：\n① 旧链加密一条 REKEY 帧\n② 双方各算 DH 并更新根密钥\n③ 重建双向链\n④ 发送方销毁旧私钥",
+        AMBER, 7.1, align="left")
     arrow(ax, (29, 14), (33, 14), lw=1.1)
 
     note(ax, 50, 2.5, "效果：攻击者即使窃取了某一时刻的棘轮私钥，下一次轮换后也无法继续推导新密钥（后向恢复）",
@@ -350,9 +378,10 @@ def fig_relay():
         box(ax, 32, y, 20, 12, "帧长检查\n4 ≤ len ≤ 1 MiB", AMBER, 7.6)
         arrow(ax, (28, y + 6), (32, y + 6), lw=1.0)
 
-    box(ax, 56, 58, 42, 12, "① 仅在全局锁内查找目标\n{ lock(g_clients_mu); dst = find(target); }", BLUE, 7.6)
-    box(ax, 56, 40, 42, 12, "② 锁外完成阻塞写\n{ lock_guard lk(dst->write_mu);\nwrite(len); write(payload); }", (("#eef7f0"), "#2e8b57"), 7.4)
-    box(ax, 56, 22, 42, 12, "③ 目标离线 → 回一条 SYSTEM 帧\n“用户 X 不在线”", (("#fdecea"), "#c0392b"), 7.8)
+    box(ax, 56, 58, 42, 12, "① 全局锁内查找目标\n{ lock(g_clients_mu); dst = find(target); }", BLUE, 7.0)
+    box(ax, 56, 40, 42, 12, "② 锁外完成阻塞写\n{ lock(dst->write_mu); write(len); write(buf); }",
+        (("#eef7f0"), "#2e8b57"), 7.0)
+    box(ax, 56, 22, 42, 12, "③ 目标离线 → 回一条 SYSTEM 帧\n“用户 X 不在线”", (("#fdecea"), "#c0392b"), 7.4)
     for y in (58, 40, 22):
         arrow(ax, (52, y + 6), (56, y + 6), lw=1.0)
 
@@ -400,19 +429,19 @@ def fig_state():
 
 # ------------------------------------------------- 10. 存储加密链 ----------
 def fig_storage():
-    fig, ax = canvas(10.0, 5.6)
+    fig, ax = canvas(10.0, 6.2)
     box(ax, 2, 76, 26, 12, "Ed25519 身份私钥\n（进程内存，64 B）", GREEN, 8.2)
     box(ax, 33, 76, 24, 12, "Windows DPAPI\nCryptProtectData", BLUE, 8.2)
     box(ax, 62, 76, 32, 12, "identity.pem\n（仅当前 Windows 账户可解）", AMBER, 8)
     arrow(ax, (28, 82), (33, 82), lw=1.1)
     arrow(ax, (57, 82), (62, 82), lw=1.1)
 
-    box(ax, 2, 52, 26, 12, "HKDF-SHA256\ninfo=“CHAT-v1 local storage key”", PURPLE, 7.6)
+    box(ax, 2, 52, 26, 12, "HKDF-SHA256\ninfo = local storage key", PURPLE, 7.2)
     arrow(ax, (15, 76), (15, 64), lw=1.1, color="#6f42c1")
-    box(ax, 33, 52, 24, 12, "本地存储密钥\n（32 B，只存在于内存）", PURPLE, 8)
+    box(ax, 33, 52, 24, 12, "本地存储密钥\n（32 B，仅在内存）", PURPLE, 7.4)
     arrow(ax, (28, 58), (33, 58), lw=1.1, color="#6f42c1")
 
-    box(ax, 62, 52, 32, 12, "AES-256-GCM（逐条记录）\nAAD = 对端 ID", RED, 8)
+    box(ax, 62, 52, 32, 12, "AES-256-GCM（逐条记录）\nAAD = 对端 ID", RED, 7.4)
     arrow(ax, (57, 58), (62, 58), lw=1.1, color="#c0392b")
     box(ax, 62, 30, 32, 14, "chats\\<本地身份指纹>\\<对端 ID>.log\n每行 = hex(nonce12 ‖ 密文 ‖ tag16)", (("#fdecea"), "#c0392b"), 7.4)
     arrow(ax, (78, 52), (78, 44), lw=1.1, color="#c0392b")
@@ -425,14 +454,14 @@ def fig_storage():
          "为什么用“身份指纹”而不是服务器 ID 做目录名？\n"
          "服务器 ID 是临时的（重启即变），身份密钥才是持久的；\n"
          "这样重启、换 ID 之后，历史记录与指纹固定依然有效。", 7.8, "#31414f", style="italic")
-    box(ax, 62, 8, 32, 14, "换账户 / 换机器拷贝文件\n→ identity.pem 无法解密\n→ 历史记录一并失效",
-        (("#f3f5f8"), "#8290a0"), 7.6)
+    box(ax, 62, 7, 32, 16, "换账户 / 换机器拷贝文件\nidentity.pem 无法解密\n历史记录一并失效",
+        (("#f3f5f8"), "#8290a0"), 7.2)
     save(fig, "fig_storage.png")
 
 
 # ------------------------------------------------- 11. 中间人拓扑 ----------
 def fig_mitm():
-    fig, ax = canvas(9.8, 4.6)
+    fig, ax = canvas(9.8, 5.6)
     box(ax, 2, 55, 24, 20, "用户 1\n（客户端 A）", BLUE, 9, bold=True)
     box(ax, 74, 55, 24, 20, "用户 2\n（客户端 B）", BLUE, 9, bold=True)
     box(ax, 34, 50, 32, 30, "中间人 MitmRelay\n\n与 A 完成一次会话\n与 B 完成另一次会话",
@@ -447,11 +476,11 @@ def fig_mitm():
     arrow(ax, (14, 55), (14, 44), lw=1.0, ls=(0, (3, 2)))
     arrow(ax, (86, 55), (86, 44), lw=1.0, ls=(0, (3, 2)))
 
-    box(ax, 26, 6, 48, 18,
+    box(ax, 26, 4, 50, 18,
         "两端都显示“加密会话已建立”，但安全码不同\n"
         "→ 口头核对一次即可发现被劫持\n"
-        "→ 攻击者在两个会话间转发明文：card-password-is-123456 被截获",
-        (("#fdecea"), "#c0392b"), 8.2)
+        "→ 攻击者在两段会话间转发明文",
+        (("#fdecea"), "#c0392b"), 7.4)
     save(fig, "fig_mitm.png")
 
 
@@ -464,24 +493,25 @@ def fig_testbar():
               "安全专项\nS-01 ~ S-06"]
     measured = [28, 5, 14, 6, 5]
     by_design = [0, 0, 0, 3, 1]
-    fig, ax = plt.subplots(figsize=(9.4, 4.4), dpi=200)
+    fig, ax = plt.subplots(figsize=(6.3, 3.2), dpi=DPI)
     y = range(len(groups))
-    ax.barh(list(y), measured, color="#2e8b57", label="实测结果与预期一致", height=0.55)
+    ax.barh(list(y), measured, color="#2e8b57", label="实测与预期一致", height=0.55)
     ax.barh(list(y), by_design, left=measured, color="#c9861a",
-            label="已实现 / 由设计保证（未构造真实攻击）", height=0.55)
+            label="已实现 / 设计保证", height=0.55)
     for i, (m, b) in enumerate(zip(measured, by_design)):
-        ax.text(m + b + 0.4, i, f"{m + b} 项", va="center", fontsize=9, color=INK)
+        ax.text(m + b + 0.5, i, "%d 项" % (m + b), va="center", fontsize=8.6, color=INK)
     ax.set_yticks(list(y))
-    ax.set_yticklabels(groups, fontsize=8.6)
+    ax.set_yticklabels(groups, fontsize=8.2)
     ax.invert_yaxis()
-    ax.set_xlabel("用例 / 断言数量", fontsize=9)
+    ax.set_xlabel("用例 / 断言数量", fontsize=8.6)
     ax.set_xlim(0, 33)
+    ax.tick_params(axis="x", labelsize=8)
     ax.grid(axis="x", color="#e3e8ee", lw=0.8)
     ax.set_axisbelow(True)
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
-    ax.legend(fontsize=8.2, loc="lower right", frameon=False)
-    ax.set_title("共 62 项测试，0 项失败", fontsize=10.5, color=INK)
+    ax.legend(fontsize=8, loc="lower right", frameon=False)
+    ax.set_title("共 62 项测试，0 项失败", fontsize=9.6, color=INK)
     fig.tight_layout()
     save(fig, "fig_testbar.png")
 
@@ -500,7 +530,7 @@ def _localize_cipher(ln):
     return ln
 
 
-def text_figure(path, name, title, max_lines=None, fs=6.6, w=9.6):
+def text_figure(path, name, title, max_lines=None, fs=7.6, w=6.3):
     if not os.path.exists(path):
         print("  !! missing", path)
         return
@@ -510,13 +540,13 @@ def text_figure(path, name, title, max_lines=None, fs=6.6, w=9.6):
         lines = [_localize_cipher(l) for l in lines]
     if max_lines:
         lines = lines[:max_lines]
-    # 按字号换算出足够容纳所有行的图高（英寸）
-    h = 0.28 + len(lines) * fs * 1.42 / 72.0 + 0.30
-    fig, ax = canvas(w, h)
+    # 按字号换算出足够容纳所有行的图高（英寸，不再乘整体缩放系数）
+    h = 0.26 + len(lines) * fs * 1.48 / 72.0 + 0.28
+    fig, ax = canvas(w, h, k=1.0)
     ax.add_patch(FancyBboxPatch((1, 1), 98, 98, boxstyle="round,pad=0.4,rounding_size=1.2",
                                 fc="#1e1e1e", ec="#3c3c3c", lw=1.2, zorder=1))
     ax.add_patch(plt.Rectangle((1, 92.5), 98, 6.5, fc="#2d2d30", ec="none", zorder=2))
-    ax.text(3.2, 95.7, title, fontsize=7.2, color="#cccccc", va="center", zorder=3,
+    ax.text(3.2, 95.7, title, fontsize=8.0, color="#cccccc", va="center", zorder=3,
             family=[CJK, MONO])
     step = 89.5 / max(len(lines), 1)
     for i, ln in enumerate(lines):
@@ -549,9 +579,9 @@ def main():
     fig_mitm()
     fig_testbar()
     text_figure(os.path.join(TEMP, "crypto_test_out.txt"), "fig_crypto_out.png",
-                "C:\\...\\build\\Debug\\CryptoTest.exe   —— 28 项断言全部通过")
+                "build\\Debug\\CryptoTest.exe　—— 28 项断言全部通过")
     text_figure(os.path.join(SHOTS, "ciphertext.txt"), "fig_ciphertext.png",
-                "落盘文件（用记事本直接打开的样子）", max_lines=14, fs=6.4, w=9.6)
+                "聊天记录文件（记事本直接打开的样子）", max_lines=14, fs=8.4, w=6.3)
 
 
 if __name__ == "__main__":
