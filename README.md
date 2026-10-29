@@ -142,13 +142,18 @@ TCP 上每条消息：
 ├── Tests/
 │   └── crypto_selftest.cpp # 密码学与协议自测（28 项）
 ├── Tools/
-│   ├── mitm_relay.cpp      # MITM 中间人演示工具（教学用）
-│   ├── mitm_demo.ps1       # MITM 演示 + 截图自动化
-│   ├── smoke_test.ps1      # 端到端功能测试
-│   └── make_report_docx.py # 按课程模板生成设计报告 docx
+│   ├── mitm_relay.cpp       # MITM 中间人演示工具（教学用）
+│   ├── mitm_demo.ps1        # MITM 演示 + 截图自动化
+│   ├── smoke_test.ps1       # 端到端功能测试
+│   ├── capture_shots.ps1    # 抓取正常会话/离线/断线截图与密文样本
+│   ├── make_figures.py      # 生成报告插图（流程图/时序图/密钥调度图等）
+│   ├── make_reports.py      # 按课程模板生成成员A/B 两份报告 docx
+│   └── make_report_docx.py  # 生成合并版报告 docx
 └── docs/
     ├── report.md                                   # 设计报告（Markdown）
-    └── 专业程序设计报告-基于ECDHE的前向保密聊天工具.docx  # 按模板排版的报告
+    ├── figures/                                    # 报告插图（由 make_figures.py 生成）
+    ├── 专业程序设计报告-成员A-密码协议方向.docx
+    └── 专业程序设计报告-成员B-网络与工程化方向.docx
 ```
 
 > 说明：`ClientGUI/ClientGUI.vcxproj`、`Server/Server.vcxproj` 与各自 `x64/` 目录是早期的 Visual Studio 手写工程，**已不再使用**，请统一用 CMake 构建，避免编译到旧代码。
@@ -305,15 +310,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\mitm_demo.ps1
 |---|---|
 | `docs/report.md` | 设计报告（Markdown）：威胁模型、协议设计、17 个真实问题的排查记录、测试与演示方案 |
 | `docs/两人分工与答辩材料.md` | 两人小组分工、完整测试用例表、8 分钟答辩脚本、论文素材（局限性与展望） |
-| `docs/专业程序设计报告-成员A-密码协议方向.docx` | 成员 A 的报告：公共章节 + 握手协议/密钥棘轮/安全性分析 |
-| `docs/专业程序设计报告-成员B-网络与工程化方向.docx` | 成员 B 的报告：公共章节 + 网络并发/客户端实现/测试工程 |
+| `docs/专业程序设计报告-成员A-密码协议方向.docx` | 成员 A 的报告（27~28 页 / 19 图 / 24 表）：公共章节 + 握手协议与密钥调度 / 密钥棘轮 / 安全性分析 |
+| `docs/专业程序设计报告-成员B-网络与工程化方向.docx` | 成员 B 的报告（27~28 页 / 19 图 / 24 表）：公共章节 + 网络与并发 / 客户端工程实现 / 测试工程与工具链 |
 | `docs/专业程序设计报告-基于ECDHE的前向保密聊天工具.docx` | 合并版报告（备查，非提交件） |
-| `Tools/make_two_reports.py` | 生成成员 A / 成员 B 两份报告（需 `pip install python-docx`） |
+| `docs/figures/` | 18 张报告插图（用例图、架构图、帧格式、握手时序、密钥调度、两层棘轮、并发模型、状态机、存储加密链、测试统计等） |
+| `Tools/make_reports.py` | 生成成员 A / 成员 B 两份报告（需 `pip install python-docx`） |
+| `Tools/make_figures.py` | 生成 `docs/figures/` 下的全部插图（需 `pip install matplotlib`） |
+| `Tools/capture_shots.ps1` | 抓取真实运行截图（正常会话、离线提示、断线重连）与密文样本 |
 | `Tools/make_report_docx.py` | 生成合并版报告 |
 
-重新生成 docx：
+重新生成两份报告（截图与插图会读取真实运行结果，因此建议按顺序执行）：
 
 ```bash
-pip install python-docx
-python Tools/make_report_docx.py
+pip install python-docx matplotlib
+powershell -ExecutionPolicy Bypass -File Tools\capture_shots.ps1   # 正常会话截图 + 密文样本
+powershell -ExecutionPolicy Bypass -File Tools\mitm_demo.ps1       # 中间人演示截图 + 日志
+python Tools\make_figures.py                                       # 流程图/时序图 + 输出配图
+python Tools\make_reports.py                                       # 两份 docx
 ```

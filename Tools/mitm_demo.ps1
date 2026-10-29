@@ -25,6 +25,8 @@ public class M32 {
     [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int idx);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageW")]
     public static extern IntPtr SendStr(IntPtr h, uint m, IntPtr w, string l);
@@ -45,6 +47,20 @@ public class M32 {
         if (n <= 0) return "";
         var sb = new StringBuilder(n + 2); GetWindowText(h, sb, n + 2);
         return sb.ToString();
+    }
+    // 状态栏文本（含“安全码”的那一行）；用 \u 转义避开 ps1 的 ANSI 编码问题
+    public static string StatusText(IntPtr parent) {
+        string found = "";
+        EnumChildWindows(parent, (h, l) => {
+            int n = GetWindowTextLength(h);
+            if (n <= 0) return true;
+            var sb = new StringBuilder(n + 2);
+            GetWindowText(h, sb, n + 2);
+            var s = sb.ToString();
+            if (s.Contains("\u5b89\u5168\u7801")) { found = s; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
     }
 }
 "@
@@ -114,9 +130,11 @@ Start-Sleep -Seconds 2
 Start-Sleep -Seconds 2
 
 # 5. 截图两个客户端（证明它们认为会话正常）
-function Capture([IntPtr]$h, [string]$path) {
+function Grab([IntPtr]$h) {
     [void][M32]::ShowWindow($h, 9)
-    Start-Sleep -Milliseconds 300
+    [void][M32]::SetWindowPos($h, [IntPtr]::Zero, 40, 40, 900, 620, 0x0040)
+    [void][M32]::SetForegroundWindow($h)
+    Start-Sleep -Milliseconds 600
     $r = New-Object M32+RECT
     [void][M32]::GetWindowRect($h, [ref]$r)
     $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
@@ -124,12 +142,31 @@ function Capture([IntPtr]$h, [string]$path) {
     $hdc = $g.GetHdc()
     [void][M32]::PrintWindow($h, $hdc, 2)
     $g.ReleaseHdc($hdc)
-    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-    $g.Dispose(); $bmp.Dispose()
+    return $bmp
 }
 
-Capture $info[1].Wnd (Join-Path $OUTDIR "client_1.png")
-Capture $info[2].Wnd (Join-Path $OUTDIR "client_2.png")
+function Capture([IntPtr]$h, [string]$path, [string]$statusPath) {
+    $bmp = Grab $h
+    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    if ($statusPath) {
+        $crop = 56
+        $strip = New-Object System.Drawing.Bitmap $bmp.Width, $crop
+        $g2 = [System.Drawing.Graphics]::FromImage($strip)
+        $dst = New-Object System.Drawing.Rectangle 0, 0, $bmp.Width, $crop
+        $src = New-Object System.Drawing.Rectangle 0, ($bmp.Height - $crop), $bmp.Width, $crop
+        $g2.DrawImage($bmp, $dst, $src, [System.Drawing.GraphicsUnit]::Pixel)
+        $strip.Save($statusPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $g2.Dispose(); $strip.Dispose()
+    }
+    $bmp.Dispose()
+}
+
+Capture $info[1].Wnd (Join-Path $OUTDIR "client_1.png") (Join-Path $OUTDIR "status_1.png")
+Capture $info[2].Wnd (Join-Path $OUTDIR "client_2.png") (Join-Path $OUTDIR "status_2.png")
+
+$s1 = [M32]::StatusText($info[1].Wnd)
+$s2 = [M32]::StatusText($info[2].Wnd)
+Set-Content -Path (Join-Path $OUTDIR "sas.txt") -Value @("c1=$s1", "c2=$s2") -Encoding UTF8
 
 Get-Process -Name ClientGUI_App,MitmRelay -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
