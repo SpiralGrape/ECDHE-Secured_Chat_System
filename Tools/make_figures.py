@@ -507,7 +507,7 @@ def fig_state():
     ax.text(66.5, 40, "心跳超时 /\n服务器关闭", fontsize=7.2, color="#c0392b", ha="center")
 
     arrow(ax, (83, 70), (58, 86), lw=1.2, ls=(0, (4, 2)), color="#c0392b", rad=0.12)
-    ax.text(72, 82, "3 秒后自动重连", fontsize=7.2, color="#c0392b", ha="center")
+    ax.text(72, 82, "2 秒后自动重连", fontsize=7.2, color="#c0392b", ha="center")
 
     note(ax, 2, 46, "服务器侧：60 秒无活动\n→ 回收该 ID", 7.4, "#a86a12", ha="left")
     note(ax, 2, 26, "重连后必须重新握手：\n旧会话密钥随 socket 一起丢弃\n（这正是前向保密的体现）",
