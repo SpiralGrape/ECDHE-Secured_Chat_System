@@ -39,6 +39,7 @@
 
 #include "crypto_utils.h"
 #include "protocol.h"
+#include "secure_session.h"
 
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -79,25 +80,14 @@ crypto::PkeyPtr g_identity;
 std::wstring    g_my_fingerprint;
 
 // 会话（跨线程访问，用 g_sess_mu 保护）
-struct Session {
-    enum class State { None, Initiator, Responder, Established };
-
-    State          state = State::None;
-    uint64_t       sid = 0;
-    crypto::PkeyPtr eph;
-    Bytes          my_pub, my_nonce, my_idpub;
-    Bytes          peer_pub, peer_nonce, peer_idpub;
-    Bytes          init_msg, resp_msg;
-    Bytes          send_chain, recv_chain;
-    Bytes          finished_key;
-    uint64_t       send_seq = 0, recv_seq = 0;
-    std::wstring   fingerprint;
-    std::deque<std::string> outbox;         // 握手完成前排队等待发送的消息
+struct PeerSession {
+    securechat::SecureSession crypto;
+    std::deque<std::string>   outbox;       // 握手完成前排队等待发送的消息
 };
 
-std::map<int, Session> g_sessions;
-std::map<int, Bytes>   g_pins;              // TOFU 指纹固定
-std::mutex             g_sess_mu;
+std::map<int, PeerSession> g_sessions;
+std::map<int, crypto::Bytes> g_pins;        // 对端身份公钥固定（持久化 TOFU）
+std::mutex                   g_sess_mu;
 
 // 聊天记录（只在 UI 线程访问）
 struct ChatMsg {
@@ -266,6 +256,69 @@ static void LoadAllChats(int profileId) {
     }
 }
 
+// ========================================================== 指纹固定 IO ====
+static std::wstring PinsFile() {
+    std::wstring dir = AppDir() + L"\\pins";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir + L"\\" + std::to_wstring(g_profileId) + L".log";
+}
+
+static void SavePin(int peer, const crypto::Bytes& pub) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, PinsFile().c_str(), L"ab") != 0 || !f) return;
+    static const char* hexd = "0123456789abcdef";
+    std::string hex;
+    for (unsigned char c : pub) { hex.push_back(hexd[c >> 4]); hex.push_back(hexd[c & 0x0F]); }
+    std::string line = std::to_string(peer) + "\t" + hex + "\n";
+    fwrite(line.data(), 1, line.size(), f);
+    fclose(f);
+}
+
+// 载入已固定的对端身份公钥（调用方需持 g_sess_mu）
+static void LoadPins() {
+    g_pins.clear();
+    std::wstring path = PinsFile();
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return;
+    std::string raw;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) raw.append(buf, n);
+    fclose(f);
+
+    auto hexv = [](wchar_t c) -> int {
+        if (c >= L'0' && c <= L'9') return (int)(c - L'0');
+        if (c >= L'a' && c <= L'f') return (int)(c - L'a') + 10;
+        if (c >= L'A' && c <= L'F') return (int)(c - L'A') + 10;
+        return -1;
+    };
+
+    std::wstring all = Utf8ToWide(raw);
+    size_t pos = 0;
+    while (pos < all.size()) {
+        size_t eol = all.find(L'\n', pos);
+        if (eol == std::wstring::npos) eol = all.size();
+        std::wstring line = all.substr(pos, eol - pos);
+        pos = eol + 1;
+
+        size_t t = line.find(L'\t');
+        if (t == std::wstring::npos) continue;
+        int peer = _wtoi(line.substr(0, t).c_str());
+        std::wstring hex = line.substr(t + 1);
+        if (peer <= 0 || hex.size() < 2) continue;
+
+        crypto::Bytes pub;
+        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+            int hi = hexv(hex[i]), lo = hexv(hex[i + 1]);
+            if (hi < 0 || lo < 0) { pub.clear(); break; }
+            pub.push_back((unsigned char)((hi << 4) | lo));
+        }
+        if (!pub.empty()) g_pins[peer] = pub;
+    }
+}
+
 // ============================================================== UI 辅助 ====
 static void RefreshSessionList() {
     if (!hSessionList) return;
@@ -371,128 +424,57 @@ static bool SendRaw(const Bytes& frame) {
     return !ec;
 }
 
-// ============================================================ 密钥派生 ====
-static void DeriveSession(Session& s, bool initiator) {
-    crypto::PkeyPtr peer = crypto::x25519_from_public_raw(s.peer_pub.data(), s.peer_pub.size());
-    Bytes z = crypto::x25519_shared(s.eph.get(), peer.get());
-
-    // salt 固定为 nonceA || nonceB（A = 发起方）
-    Bytes salt = initiator ? crypto::cat(s.my_nonce, s.peer_nonce)
-                           : crypto::cat(s.peer_nonce, s.my_nonce);
-
-    Bytes secret = crypto::hkdf(z, salt, "CHAT-v1 ECDHE X25519", 32);
-    Bytes c_i2r  = crypto::hkdf(secret, Bytes{}, "chain initiator->responder", 32);
-    Bytes c_r2i  = crypto::hkdf(secret, Bytes{}, "chain responder->initiator", 32);
-    s.finished_key = crypto::hkdf(secret, Bytes{}, "finished key", 32);
-
-    crypto::wipe(s.send_chain);
-    crypto::wipe(s.recv_chain);
-    s.send_chain = initiator ? c_i2r : c_r2i;
-    s.recv_chain = initiator ? c_r2i : c_i2r;
-    s.fingerprint = HexW(crypto::sha256(secret), 8);
-
-    crypto::wipe(z);
-    crypto::wipe(secret);
-    crypto::wipe(c_i2r);
-    crypto::wipe(c_r2i);
-
-    // 前向保密关键：临时私钥用完即毁
-    s.eph.reset();
-}
-
-static Bytes TranscriptHash(const Bytes& a, const Bytes& b) {
-    return crypto::sha256(crypto::cat(a, b));
-}
-
 // ======================================================= 会话（需持锁） ====
-static void LockedSendChat(int peer, Session& s, const std::string& text) {
-    Bytes msg_key = crypto::hkdf(s.send_chain, Bytes{}, "message key", 32);
-    Bytes nonce   = crypto::hkdf(s.send_chain, Bytes{}, "message iv", 12);
-    Bytes next    = crypto::hkdf(s.send_chain, Bytes{}, "chain next", 32);
-
-    Bytes aad = proto::make_aad(proto::DATA, s.sid, s.send_seq, my_client_id, peer);
-    Bytes ct;
-    try {
-        ct = crypto::aead_encrypt(msg_key, nonce, text, aad);
-    } catch (...) {
-        crypto::wipe(msg_key); crypto::wipe(nonce); crypto::wipe(next);
+static void LockedSendChat(int peer, PeerSession& ps, const std::string& text) {
+    Bytes payload;
+    std::string err;
+    if (!ps.crypto.Seal(my_client_id, peer, text, payload, err)) {
+        PostStatus(Utf8ToWide(err), true);
         return;
     }
-
-    Bytes payload;
-    payload.push_back(proto::VERSION);
-    payload.push_back(proto::DATA);
-    proto::append_u64(payload, s.sid);
-    proto::append_u64(payload, s.send_seq);
-    proto::append(payload, ct);
-    s.send_seq++;
-
-    crypto::wipe(s.send_chain);
-    s.send_chain = next;
-    crypto::wipe(msg_key);
-    crypto::wipe(nonce);
-    crypto::wipe(next);
-
     SendRaw(MakeFrame(peer, payload));
 }
 
-static void LockedFlushOutbox(int peer, Session& s) {
-    while (!s.outbox.empty()) {
-        std::string m = s.outbox.front();
-        s.outbox.pop_front();
-        LockedSendChat(peer, s, m);
+static void LockedFlushOutbox(int peer, PeerSession& ps) {
+    while (!ps.outbox.empty()) {
+        std::string m = ps.outbox.front();
+        ps.outbox.pop_front();
+        LockedSendChat(peer, ps, m);
     }
 }
 
+// 会话建立后的状态栏提示：安全码 + 密钥指纹
+static void PostEstablished(int peer, const securechat::SecureSession& c) {
+    PostStatus(L"与用户 " + std::to_wstring(peer) + L" 的加密会话已建立 · 安全码 " +
+               Utf8ToWide(c.sas()) + L"（请与对方口头核对）· 密钥指纹 " +
+               Utf8ToWide(c.fingerprint()));
+}
+
 static void LockedStartHandshake(int peer) {
-    Session& s = g_sessions[peer];
-    std::deque<std::string> saved;
-    saved.swap(s.outbox);
-
-    s = Session();
-    s.outbox.swap(saved);
-    s.state = Session::State::Initiator;
-
-    try {
-        s.sid      = crypto::random_u64();
-        s.eph      = crypto::x25519_generate();
-        s.my_pub   = crypto::x25519_public_raw(s.eph.get());
-        s.my_nonce = crypto::random_bytes(proto::NONCE_LEN);
-        s.my_idpub = crypto::ed25519_public_raw(g_identity.get());
-    } catch (...) {
-        s.state = Session::State::None;
-        PostStatus(L"生成会话临时密钥失败", true);
+    PeerSession& ps = g_sessions[peer];
+    Bytes payload;
+    std::string err;
+    if (!ps.crypto.BuildInit(crypto::random_u64(), my_client_id, peer,
+                             g_identity.get(), payload, err)) {
+        PostStatus(L"建立会话失败：" + Utf8ToWide(err), true);
         return;
     }
-
-    Bytes msg;
-    msg.push_back(proto::VERSION);
-    msg.push_back(proto::HS_INIT);
-    proto::append_u64(msg, s.sid);
-    proto::append(msg, s.my_pub);
-    proto::append(msg, s.my_nonce);
-    proto::append(msg, s.my_idpub);
-    proto::append_u32(msg, (uint32_t)my_client_id);
-    proto::append_u32(msg, (uint32_t)peer);
-
-    Bytes sig = crypto::ed25519_sign(g_identity.get(), msg);
-
-    Bytes payload = msg;
-    proto::append(payload, sig);
-    s.init_msg = payload;
-
     SendRaw(MakeFrame(peer, payload));
     PostStatus(L"正在与用户 " + std::to_wstring(peer) + L" 协商 ECDHE 会话…");
 }
 
-static bool CheckPin(int peer, const Bytes& idpub) {
+// 身份公钥固定（TOFU）：首次见面即记录，之后变化即视为中间人
+static bool CheckPin(int peer, const crypto::Bytes& idpub) {
     auto it = g_pins.find(peer);
     if (it == g_pins.end()) {
         g_pins[peer] = idpub;
+        SavePin(peer, idpub);
         return true;
     }
     if (it->second != idpub) {
-        PostChat(peer, 2, L"对端身份公钥发生变化，可能存在中间人攻击，已中止");
+        PostChat(peer, 2, L"对端身份公钥与已记录的指纹不一致，可能存在中间人攻击，已中止"
+                          L"（若确认对方是换了新客户端，可删除 %APPDATA%\\ECDHE_Chat\\pins 后重试）");
+        PostStatus(L"用户 " + std::to_wstring(peer) + L" 身份指纹变化，已阻断", true);
         return false;
     }
     return true;
@@ -508,214 +490,88 @@ static void HandleSystem(const Bytes& body);
 static void HandleInit(int sender, const Bytes& body) {
     if (body.size() != proto::HS_INIT_LEN) return;
 
-    const uint64_t sid = proto::get_u64(body.data() + 2);
-    Bytes pubA         = proto::slice(body, 10, proto::X25519_LEN);
-    Bytes nonceA       = proto::slice(body, 42, proto::NONCE_LEN);
-    Bytes idpubA       = proto::slice(body, 58, proto::ED25519_LEN);
-    const uint32_t idA = proto::get_u32(body.data() + 90);
-    const uint32_t idB = proto::get_u32(body.data() + 94);
-    Bytes sigA         = proto::slice(body, 98, proto::SIG_LEN);
-
-    if ((int)idA != sender || (int)idB != my_client_id) return;
-
-    if (!crypto::ed25519_verify(idpubA, proto::slice(body, 0, proto::HS_INIT_BASE), sigA)) {
-        PostChat(sender, 2, L"对端握手签名无效，已丢弃（可能是中间人）");
-        return;
-    }
-
     std::lock_guard<std::mutex> lk(g_sess_mu);
 
     // 同时发起握手时的确定性仲裁：ID 小的一方胜出
     auto it = g_sessions.find(sender);
     if (it != g_sessions.end() &&
-        it->second.state == Session::State::Initiator &&
+        it->second.crypto.state() == securechat::SecureSession::State::Initiating &&
         my_client_id < sender) {
         return;
     }
-    if (!CheckPin(sender, idpubA)) return;
 
-    Session& s = g_sessions[sender];
-    std::deque<std::string> saved;
-    saved.swap(s.outbox);
-
-    s = Session();
-    s.outbox.swap(saved);
-    s.state      = Session::State::Responder;
-    s.sid        = sid;
-    s.peer_pub   = pubA;
-    s.peer_nonce = nonceA;
-    s.peer_idpub = idpubA;
-    s.init_msg   = body;
-
-    try {
-        s.eph      = crypto::x25519_generate();
-        s.my_pub   = crypto::x25519_public_raw(s.eph.get());
-        s.my_nonce = crypto::random_bytes(proto::NONCE_LEN);
-        s.my_idpub = crypto::ed25519_public_raw(g_identity.get());
-
-        Bytes resp;
-        resp.push_back(proto::VERSION);
-        resp.push_back(proto::HS_RESP);
-        proto::append_u64(resp, s.sid);
-        proto::append(resp, s.my_pub);
-        proto::append(resp, s.my_nonce);
-        proto::append(resp, s.my_idpub);
-
-        Bytes to_sign = resp;
-        proto::append(to_sign, sigA);
-        Bytes sigB = crypto::ed25519_sign(g_identity.get(), to_sign);
-        proto::append(resp, sigB);
-
-        DeriveSession(s, /*initiator=*/false);
-
-        Bytes th = TranscriptHash(s.init_msg, resp);
-        Bytes mac_input = th;
-        mac_input.push_back('B');
-        Bytes macB = crypto::hmac_sha256(s.finished_key, mac_input);
-
-        s.resp_msg = resp;
-        Bytes payload = resp;
-        proto::append(payload, macB);
-
-        SendRaw(MakeFrame(sender, payload));
-        PostStatus(L"正在与用户 " + std::to_wstring(sender) + L" 协商 ECDHE 会话…");
-    } catch (...) {
-        s.state = Session::State::None;
-        PostStatus(L"处理握手请求时出错", true);
+    PeerSession& ps = g_sessions[sender];
+    Bytes resp;
+    std::string err;
+    if (!ps.crypto.HandleInit(body, my_client_id, sender, g_identity.get(), resp, err)) {
+        PostChat(sender, 2, L"握手失败：" + Utf8ToWide(err));
+        g_sessions.erase(sender);
+        return;
     }
+    if (!CheckPin(sender, ps.crypto.peerIdentity())) {
+        g_sessions.erase(sender);
+        return;
+    }
+
+    SendRaw(MakeFrame(sender, resp));
+    PostStatus(L"正在与用户 " + std::to_wstring(sender) + L" 协商 ECDHE 会话…");
 }
 
 static void HandleResp(int sender, const Bytes& body) {
-    if (body.size() != proto::HS_RESP_LEN) return;
-
-    const uint64_t sid = proto::get_u64(body.data() + 2);
-    Bytes pubB         = proto::slice(body, 10, proto::X25519_LEN);
-    Bytes nonceB       = proto::slice(body, 42, proto::NONCE_LEN);
-    Bytes idpubB       = proto::slice(body, 58, proto::ED25519_LEN);
-    Bytes sigB         = proto::slice(body, 90, proto::SIG_LEN);
-    Bytes macB         = proto::slice(body, proto::HS_RESP_SIGN, proto::KEY_LEN);
-    Bytes resp_core    = proto::slice(body, 0, proto::HS_RESP_SIGN);
-
     std::lock_guard<std::mutex> lk(g_sess_mu);
     auto it = g_sessions.find(sender);
-    if (it == g_sessions.end() || it->second.state != Session::State::Initiator) return;
-    Session& s = it->second;
-    if (s.sid != sid || s.init_msg.size() != proto::HS_INIT_LEN) return;
+    if (it == g_sessions.end()) return;
+    PeerSession& ps = it->second;
+    if (ps.crypto.state() != securechat::SecureSession::State::Initiating) return;
 
-    Bytes sigA = proto::slice(s.init_msg, proto::HS_INIT_BASE, proto::SIG_LEN);
-    // 签名覆盖：RESP 前 90 字节 + 对方 INIT 的签名（不含 sigB 自身）
-    Bytes to_sign = proto::slice(body, 0, proto::HS_RESP_BASE);
-    proto::append(to_sign, sigA);
-    if (!crypto::ed25519_verify(idpubB, to_sign, sigB)) {
-        PostChat(sender, 2, L"对端握手响应签名无效，会话已中止");
+    Bytes confirm;
+    std::string err;
+    if (!ps.crypto.HandleResp(body, my_client_id, sender, confirm, err)) {
+        PostChat(sender, 2, L"握手失败：" + Utf8ToWide(err) + L"，会话已中止");
         g_sessions.erase(it);
         return;
     }
-    if (!CheckPin(sender, idpubB)) { g_sessions.erase(it); return; }
-
-    s.peer_pub   = pubB;
-    s.peer_nonce = nonceB;
-    s.peer_idpub = idpubB;
-
-    try {
-        DeriveSession(s, /*initiator=*/true);
-    } catch (...) {
-        g_sessions.erase(it);
-        PostStatus(L"会话密钥派生失败", true);
-        return;
-    }
-
-    Bytes th = TranscriptHash(s.init_msg, resp_core);
-    Bytes mac_input = th;
-    mac_input.push_back('B');
-    Bytes expect = crypto::hmac_sha256(s.finished_key, mac_input);
-    if (expect != macB) {
-        PostChat(sender, 2, L"会话密钥确认失败，握手已中止");
+    if (!CheckPin(sender, ps.crypto.peerIdentity())) {
         g_sessions.erase(it);
         return;
     }
 
-    Bytes mac_input_a = th;
-    mac_input_a.push_back('A');
-    Bytes macA = crypto::hmac_sha256(s.finished_key, mac_input_a);
-
-    Bytes payload;
-    payload.push_back(proto::VERSION);
-    payload.push_back(proto::HS_CONFIRM);
-    proto::append_u64(payload, s.sid);
-    proto::append(payload, macA);
-    SendRaw(MakeFrame(sender, payload));
-
-    s.state = Session::State::Established;
-    s.resp_msg = resp_core;
-    PostStatus(L"与用户 " + std::to_wstring(sender) + L" 的安全会话已建立 · 密钥指纹 " + s.fingerprint);
-    LockedFlushOutbox(sender, s);
+    SendRaw(MakeFrame(sender, confirm));
+    PostEstablished(sender, ps.crypto);
+    LockedFlushOutbox(sender, ps);
 }
 
 static void HandleConfirm(int sender, const Bytes& body) {
-    if (body.size() != proto::HS_CONFIRM_LEN) return;
-    const uint64_t sid = proto::get_u64(body.data() + 2);
-    Bytes macA = proto::slice(body, 10, proto::KEY_LEN);
-
     std::lock_guard<std::mutex> lk(g_sess_mu);
     auto it = g_sessions.find(sender);
-    if (it == g_sessions.end() || it->second.state != Session::State::Responder) return;
-    Session& s = it->second;
-    if (s.sid != sid) return;
+    if (it == g_sessions.end()) return;
+    PeerSession& ps = it->second;
+    if (ps.crypto.state() != securechat::SecureSession::State::Responding) return;
 
-    Bytes th = TranscriptHash(s.init_msg, s.resp_msg);
-    Bytes mac_input = th;
-    mac_input.push_back('A');
-    Bytes expect = crypto::hmac_sha256(s.finished_key, mac_input);
-    if (expect != macA) {
-        PostChat(sender, 2, L"对端握手确认无效，会话未建立");
+    std::string err;
+    if (!ps.crypto.HandleConfirm(body, err)) {
+        PostChat(sender, 2, L"握手确认失败：" + Utf8ToWide(err));
         g_sessions.erase(it);
         return;
     }
 
-    s.state = Session::State::Established;
-    PostStatus(L"与用户 " + std::to_wstring(sender) + L" 的安全会话已建立 · 密钥指纹 " + s.fingerprint);
-    LockedFlushOutbox(sender, s);
+    PostEstablished(sender, ps.crypto);
+    LockedFlushOutbox(sender, ps);
 }
 
 static void HandleData(int sender, const Bytes& body) {
-    if (body.size() < proto::DATA_MIN) return;
-    const uint64_t sid = proto::get_u64(body.data() + 2);
-    const uint64_t seq = proto::get_u64(body.data() + 10);
-    Bytes ct = proto::slice(body, proto::DATA_HEADER, body.size() - proto::DATA_HEADER);
-
     std::lock_guard<std::mutex> lk(g_sess_mu);
     auto it = g_sessions.find(sender);
-    if (it == g_sessions.end() || it->second.state != Session::State::Established) return;
-    Session& s = it->second;
-    if (s.sid != sid || seq != s.recv_seq) {
-        PostChat(sender, 2, L"会话状态失步或检测到重放，已重置会话");
+    if (it == g_sessions.end()) return;
+    PeerSession& ps = it->second;
+    if (!ps.crypto.established()) return;
+
+    std::string plain, err;
+    if (!ps.crypto.Open(my_client_id, sender, body, plain, err)) {
+        PostChat(sender, 2, L"消息校验失败：" + Utf8ToWide(err) + L"，已重置会话");
         g_sessions.erase(it);
         return;
     }
-
-    Bytes msg_key = crypto::hkdf(s.recv_chain, Bytes{}, "message key", 32);
-    Bytes nonce   = crypto::hkdf(s.recv_chain, Bytes{}, "message iv", 12);
-    Bytes next    = crypto::hkdf(s.recv_chain, Bytes{}, "chain next", 32);
-
-    Bytes aad = proto::make_aad(proto::DATA, sid, seq, sender, my_client_id);
-    std::string plain;
-    bool ok = crypto::aead_decrypt(msg_key, nonce, ct, aad, plain);
-
-    crypto::wipe(msg_key);
-    crypto::wipe(nonce);
-
-    if (!ok) {
-        crypto::wipe(next);
-        PostChat(sender, 2, L"消息认证失败（被篡改或密钥不匹配），已重置会话");
-        g_sessions.erase(it);
-        return;
-    }
-
-    crypto::wipe(s.recv_chain);
-    s.recv_chain = next;
-    crypto::wipe(next);
-    s.recv_seq++;
 
     PostChat(sender, 0, Utf8ToWide(plain));
 }
@@ -730,7 +586,7 @@ static void HandleSystem(const Bytes& body) {
     auto it = g_sessions.find(related);
     if (it != g_sessions.end()) {
         size_t pending = it->second.outbox.size();
-        bool established = (it->second.state == Session::State::Established);
+        bool established = it->second.crypto.established();
         g_sessions.erase(it);
 
         if (pending > 0) {
@@ -828,13 +684,13 @@ static void SendUserMessage(int target, const std::wstring& wtext, bool& queued)
     std::string text = WideToUtf8(wtext);
 
     std::lock_guard<std::mutex> lk(g_sess_mu);
-    Session& s = g_sessions[target];
-    if (s.state == Session::State::Established) {
+    PeerSession& s = g_sessions[target];
+    if (s.crypto.established()) {
         LockedSendChat(target, s, text);
     } else {
         s.outbox.push_back(text);
         queued = true;
-        if (s.state != Session::State::Initiator) LockedStartHandshake(target);
+        if (s.crypto.state() != securechat::SecureSession::State::Initiating) LockedStartHandshake(target);
     }
 }
 
@@ -875,6 +731,14 @@ static void OnSessionChanged() {
     RefreshChatView();
     RefreshSessionList();
     SetFocus(hInputBox);
+
+    // 若已有会话，回显安全码，方便随时核对
+    {
+        std::lock_guard<std::mutex> lk(g_sess_mu);
+        auto it = g_sessions.find(peer);
+        if (it != g_sessions.end() && it->second.crypto.established())
+            PostEstablished(peer, it->second.crypto);
+    }
 }
 
 static void OnSendClicked() {
@@ -1050,6 +914,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_LOAD_CHATS:
     {
         LoadAllChats((int)wParam);
+        {
+            std::lock_guard<std::mutex> lk(g_sess_mu);
+            LoadPins();
+        }
 
         // 自动选中最近一次会话，打开即可看到上次的聊天记录
         int best = 0;

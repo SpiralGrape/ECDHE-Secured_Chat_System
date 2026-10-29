@@ -55,3 +55,16 @@ add_executable(CryptoTest
 )
 target_include_directories(CryptoTest PRIVATE ${COMMON_DIR})
 target_link_libraries(CryptoTest PRIVATE OpenSSL::Crypto ws2_32)
+
+# --------------------------------------------------- MITM 演示工具（教学用）----
+add_executable(MitmRelay
+    Tools/mitm_relay.cpp
+)
+target_include_directories(MitmRelay PRIVATE ${COMMON_DIR})
+target_link_libraries(MitmRelay PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Boost::system
+    Threads::Threads
+    ws2_32
+)
