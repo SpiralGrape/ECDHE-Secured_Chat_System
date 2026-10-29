@@ -7,6 +7,7 @@
   %TEMP%\\crypto_test_out.txt  CryptoTest.exe 的真实输出
 """
 import os
+import re
 
 import matplotlib
 matplotlib.use("Agg")
@@ -37,20 +38,103 @@ PURPLE = ("#f3eefb", "#6f42c1")
 
 # 记录“文字-方框”对，在 save() 时检查文字是否溢出方框
 _CHECK = []
+_NOTES = []
+_LABELS = []
+_RECTS = []
+_ARROWS = []
+
+
+def _bbox(t, r):
+    b = t.get_window_extent(r)
+    return (b.x0, b.y0, b.x1, b.y1)
+
+
+def _inter(a, b, pad=1.0):
+    return not (a[2] - pad <= b[0] or b[2] - pad <= a[0] or
+                a[3] - pad <= b[1] or b[3] - pad <= a[1])
 
 
 def _check(name):
-    """打印溢出告警（文字超出方框），用于逐条修正排版。"""
+    """打印排版告警：文字超框 / 超出画布 / 注释压框 / 注释互相重叠。"""
     fig = plt.gcf()
     fig.canvas.draw()
     r = fig.canvas.get_renderer()
+    cb = None
+    ab = fig.axes[0].get_window_extent(r)
+    canvas_box = (ab.x0, ab.y0, ab.x1, ab.y1)
+
     for p, t in _CHECK:
-        pb = p.get_window_extent(r)
-        tb = t.get_window_extent(r)
-        if tb.width > pb.width - 1.5 or tb.height > pb.height - 1.5:
-            print("    !! OVERFLOW %-20s %-28s text=%4.0f box=%4.0f"
-                  % (name, repr(t.get_text())[:28], tb.width, pb.width))
+        pb = _bbox(p, r)
+        tb = _bbox(t, r)
+        if tb[2] - tb[0] > pb[2] - pb[0] - 1.5 or tb[3] - tb[1] > pb[3] - pb[1] - 1.5:
+            print("    !! OVERFLOW %-20s %-26s tw=%.0f bw=%.0f th=%.0f bh=%.0f"
+                  % (name, repr(t.get_text())[:26], tb[2] - tb[0], pb[2] - pb[0],
+                     tb[3] - tb[1], pb[3] - pb[1]))
+
+    for t in _NOTES + _LABELS:
+        tb = _bbox(t, r)
+        if (tb[0] < canvas_box[0] + 1 or tb[2] > canvas_box[2] - 1 or
+                tb[1] < canvas_box[1] + 1 or tb[3] > canvas_box[3] - 1):
+            print("    !! CLIPPED  %-20s %s" % (name, repr(t.get_text())[:34]))
+
+    boxes = [(p, t) for p, t in _CHECK]
+    for t in _NOTES:
+        tb = _bbox(t, r)
+        for p, bt in boxes:
+            pb = _bbox(p, r)
+            if _inter(tb, pb):
+                # 注释中心落在框内且框完全包住注释 → 视为“有意放置”
+                cx, cy = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
+                inside = pb[0] <= cx <= pb[2] and pb[1] <= cy <= pb[3]
+                covered = pb[0] <= tb[0] + 1 and tb[2] <= pb[2] - 1 and pb[1] <= tb[1] + 1 and tb[3] <= pb[3] - 1
+                if not (inside and covered):
+                    print("    !! HIT-BOX  %-20s %-30s %s"
+                          % (name, repr(t.get_text())[:30], repr(bt.get_text())[:22]))
+
+    alltxt = [(_bbox(t, r), t) for t in _NOTES]
+    for i in range(len(alltxt)):
+        for j in range(i + 1, len(alltxt)):
+            if _inter(alltxt[i][0], alltxt[j][0]):
+                print("    !! HIT-TXT  %-20s %s | %s"
+                      % (name, repr(alltxt[i][1].get_text())[:24],
+                         repr(alltxt[j][1].get_text())[:24]))
+
+    # 连线穿过方框（视觉上最频发的“乱”）
+    for (x1, y1), (x2, y2), rad in _ARROWS:
+        cx = (x1 + x2) / 2 + rad * (y2 - y1)
+        cy = (y1 + y2) / 2 - rad * (x2 - x1)
+        for (rx, ry, rw, rh, rname) in _RECTS:
+            hit = False
+            for k in range(1, 40):
+                t2 = k / 40.0
+                px = (1 - t2) ** 2 * x1 + 2 * (1 - t2) * t2 * cx + t2 ** 2 * x2
+                py = (1 - t2) ** 2 * y1 + 2 * (1 - t2) * t2 * cy + t2 ** 2 * y2
+                if rx + 1 < px < rx + rw - 1 and ry + 1 < py < ry + rh - 1:
+                    hit = True
+                    break
+            if hit:
+                print("    !! ARROW-IN %-20s (%.0f,%.0f)->(%.0f,%.0f) 穿过 %s"
+                      % (name, x1, y1, x2, y2, rname))
+
+    # 方框互相重叠（完全包含视为“容器”，不算问题）
+    for i in range(len(_RECTS)):
+        ax1, ay1, aw1, ah1, an1 = _RECTS[i]
+        for j in range(i + 1, len(_RECTS)):
+            bx1, by1, bw1, bh1, bn2 = _RECTS[j]
+            if not (ax1 < bx1 + bw1 - 1 and bx1 < ax1 + aw1 - 1 and
+                    ay1 < by1 + bh1 - 1 and by1 < ay1 + ah1 - 1):
+                continue
+            contains = (ax1 <= bx1 and ay1 <= by1 and
+                        bx1 + bw1 <= ax1 + aw1 and by1 + bh1 <= ay1 + ah1) or \
+                       (bx1 <= ax1 and by1 <= ay1 and
+                        ax1 + aw1 <= bx1 + bw1 and ay1 + ah1 <= by1 + bh1)
+            if not contains:
+                print("    !! BOX-OVLP %-20s %s | %s" % (name, an1, bn2))
     _CHECK.clear()
+    _NOTES.clear()
+    _LABELS.clear()
+    _RECTS.clear()
+    _ARROWS.clear()
 
 
 # 插图按“最终印刷尺寸”绘制：画布宽度接近插入宽度（16 cm ≈ 6.3 in），
@@ -82,6 +166,7 @@ def box(ax, x, y, w, h, text, colors=BLUE, fs=9, bold=False, ls="-", lw=1.2,
     t = ax.text(tx, y + h / 2, text, ha=ha, va="center", fontsize=fs, color=tc,
                 fontweight="bold" if bold else "normal", zorder=z + 1, linespacing=1.45)
     _CHECK.append((p, t))
+    _RECTS.append((x, y, w, h, text[:10]))
     return p
 
 
@@ -93,14 +178,18 @@ def arrow(ax, p1, p2, color="#2f6db0", lw=1.4, style="-|>", ls="-", rad=0.0,
     if label:
         mx = p1[0] + (p2[0] - p1[0]) * lp + dx
         my = p1[1] + (p2[1] - p1[1]) * lp + dy
-        ax.text(mx, my, label, ha="center", va="center", fontsize=fs,
-                color=tc or color, zorder=6,
-                bbox=dict(fc="white", ec="none", alpha=0.92, pad=1.2))
+        t = ax.text(mx, my, label, ha="center", va="center", fontsize=fs,
+                    color=tc or color, zorder=6,
+                    bbox=dict(fc="white", ec="none", alpha=0.92, pad=1.2))
+        _LABELS.append(t)
+    _ARROWS.append((tuple(p1), tuple(p2), rad))
 
 
 def note(ax, x, y, text, fs=8, color=INK, ha="center", style="normal"):
-    ax.text(x, y, text, ha=ha, va="center", fontsize=fs, color=color,
-            style=style, zorder=5)
+    t = ax.text(x, y, text, ha=ha, va="center", fontsize=fs, color=color,
+                style=style, zorder=5)
+    _NOTES.append(t)
+    return t
 
 
 def save(fig, name):
@@ -141,16 +230,16 @@ def fig_usecase():
         ax.plot([x, x + 2.6], [y - 1.6, y - 5.4], color=color, lw=1.4, zorder=3)
         note(ax, x, y - 8.5, name, 9, color)
 
-    actor(10, 60, "用户（客户端 A/B）", "#2f6db0")
-    actor(90, 62, "中继服务器", "#8290a0")
-    actor(90, 22, "攻击者", "#c0392b")
+    actor(12, 60, "用户 A / B", "#2f6db0")
+    actor(90, 60, "攻击者", "#c0392b")
+    actor(90, 30, "中继服务器", "#8290a0")
 
     for y in ys[:5]:
-        ax.plot([14, 30], [57, y], color="#9bb4cc", lw=0.9, zorder=1)
-    ax.plot([86, 70], [62, 14], color="#a8b3bf", lw=0.9, zorder=1)
-    ax.plot([86, 70], [26, 72], color="#c0392b", lw=1.1, ls=(0, (4, 2)), zorder=1)
+        ax.plot([16, 30], [57, y], color="#9bb4cc", lw=0.9, zorder=1)
+    ax.plot([86, 70], [33, 14], color="#a8b3bf", lw=0.9, zorder=1)
+    ax.plot([86, 70], [56, 72], color="#c0392b", lw=1.1, ls=(0, (4, 2)), zorder=1)
 
-    note(ax, 87, 3, "中间人劫持会被两端不同的安全码发现", 7.6, "#c0392b")
+    note(ax, 50, 4, "红色虚线：中间人劫持路径（两端安全码因此不同）", 7.4, "#c0392b")
     save(fig, "fig_usecase.png")
 
 
@@ -178,13 +267,12 @@ def fig_arch():
     box(ax, 36.5, 43, 27, 14, "心跳应答 PONG\n60 秒无活动回收 ID", AMBER, 7.6)
     box(ax, 36.5, 26, 27, 14, "帧长检查\n4 B ≤ len ≤ 1 MiB", AMBER, 7.6)
 
-    arrow(ax, (30, 52), (36.5, 52), label="密文帧", fs=8)
-    arrow(ax, (36.5, 44), (30, 44), label="密文帧", fs=8, dy=-2.4)
-    arrow(ax, (63.5, 52), (70.5, 52), label="密文帧", fs=8)
-    arrow(ax, (70.5, 44), (63.5, 44), label="密文帧", fs=8, dy=-2.4)
+    arrow(ax, (30, 52), (36.5, 52), label="密文帧", fs=7.6)
+    arrow(ax, (36.5, 44), (30, 44), label="密文帧", fs=7.6, dy=-2.4)
+    arrow(ax, (63.5, 52), (70.5, 52), label="密文帧", fs=7.6)
+    arrow(ax, (70.5, 44), (63.5, 44), label="密文帧", fs=7.6, dy=-2.4)
 
-    note(ax, 50, 10, "服务器被攻破也只能得到密文与元数据；任何篡改都会因 AAD 认证失败而被丢弃",
-         7.6, "#7a4b0c")
+    note(ax, 50, 9, "服务器被攻破也只能得到密文与元数据；\n篡改会被 AAD 认证拒绝", 7.4, "#7a4b0c")
     save(fig, "fig_arch.png")
 
 
@@ -295,12 +383,11 @@ def fig_kdf():
         box(ax, x, 44, 22, 10, t, AMBER, 8)
         arrow(ax, (50, 60), (x + 11, 54), rad=0.0, lw=1.0)
 
-    note(ax, 13, 36, "发送链", 7.6, "#a86a12", style="italic")
+    note(ax, 13, 39.5, "发送链", 7.6, "#a86a12", style="italic")
     subs = [("消息密钥\n(32 B)", 2), ("nonce / IV\n(12 B)", 26), ("下一链密钥\n(32 B)", 50)]
     for t, x in subs:
         box(ax, x, 26, 22, 9, t, (("#eaf2fb"), "#2f6db0"), 7.8)
-        arrow(ax, (13, 34), (x + 11, 35), rad=-0.05, lw=1.0)
-    arrow(ax, (61, 35), (13, 44), rad=0.30, lw=1.3, color="#c0392b")
+        arrow(ax, (13, 44), (x + 11, 35), lw=1.0)
     note(ax, 37, 20, "chain' 回写为下一轮的链密钥（旧值立即清零）", 7.6, "#c0392b")
 
     box(ax, 76, 26, 21, 9, "root'\n= HKDF(DH, root)", (("#f3eefb"), "#6f42c1"), 7.8)
@@ -326,7 +413,6 @@ def fig_msg_ratchet():
         arrow(ax, (x + 9.5, 58), (x + 9.5, 43), lw=1.1, color="#2e8b57")
         note(ax, x + 9.5, 28, f"加密第 {i + 1} 条消息", 7.6, "#5b7086")
 
-    arrow(ax, (91, 52), (91, 20), rad=0.0, lw=0, color="white")
     note(ax, 50, 19, "chain$_{i+1}$ = HKDF(chain$_{i}$, “chain next”)　然后把 chain$_{i}$ 清零覆盖", 8.8,
          "#c0392b")
     note(ax, 50, 11,
@@ -396,34 +482,37 @@ def fig_relay():
 
 # ------------------------------------------------- 9. 客户端状态机 ----------
 def fig_state():
-    fig, ax = canvas(9.8, 5.2)
+    fig, ax = canvas(9.8, 5.6)
     states = [
-        ("启动", 3, 78, GRAY),
-        ("连接中\nconnect(127.0.0.1:9000)", 23, 78, BLUE),
-        ("已连接\n（服务器分配临时 ID）", 46, 78, BLUE),
-        ("握手进行中\nINIT/RESP/CONFIRM", 46, 46, PURPLE),
-        ("会话已建立\n显示安全码 + 指纹", 46, 14, GREEN),
-        ("断线 / 重试\n15 秒无 PONG", 74, 46, RED),
+        ("启动", 4, 80, 18, 12, GRAY),
+        ("连接中\nconnect(:9000)", 32, 80, 26, 12, BLUE),
+        ("已连接\n（服务器分配 ID）", 32, 58, 26, 12, BLUE),
+        ("握手进行中\nINIT / RESP / CONFIRM", 32, 36, 26, 12, PURPLE),
+        ("会话已建立\n显示安全码 + 指纹", 32, 14, 26, 12, GREEN),
+        ("断线 / 重试\n15 秒无 PONG", 70, 58, 26, 12, RED),
     ]
-    for t, x, y, c in states:
-        box(ax, x, y, 24, 14, t, c, 8.2, bold=(c is GREEN))
+    for t, x, y, w, h, c in states:
+        box(ax, x, y, w, h, t, c, 8.0, bold=(c is GREEN))
 
-    arrow(ax, (15, 85), (23, 85), lw=1.2)
-    arrow(ax, (35, 85), (46, 85), lw=1.2, label="连接成功", fs=7.4, dy=3.0)
-    arrow(ax, (58, 78), (58, 60), lw=1.2, label="首次发送 / 收到 INIT", fs=7.4, dx=0.0, dy=0)
-    ax.text(59.5, 69, "首次发送 / 收到 INIT", fontsize=7.4, color="#2f6db0", va="center")
-    arrow(ax, (58, 46), (58, 28), lw=1.2)
-    ax.text(59.5, 37, "MAC_A / MAC_B 校验通过", fontsize=7.4, color="#2e8b57", va="center")
-    arrow(ax, (70, 78), (74, 60), lw=1.2, color="#c0392b", rad=-0.15)
-    ax.text(80, 68, "socket 读失败", fontsize=7.4, color="#c0392b", va="center")
-    arrow(ax, (70, 21), (74, 46), lw=1.2, color="#c0392b", rad=0.2)
-    ax.text(86, 30, "心跳超时\n或服务器关闭", fontsize=7.4, color="#c0392b", va="center", ha="center")
-    arrow(ax, (74, 53), (35, 82), lw=1.2, color="#c0392b", ls=(0, (4, 2)), rad=0.25,
-          label="3 秒后自动重连", fs=7.4, tc="#c0392b", dx=6, dy=-6)
+    arrow(ax, (22, 86), (32, 86), lw=1.2)
+    arrow(ax, (45, 80), (45, 70), lw=1.2)
+    ax.text(46.5, 75, "连接成功", fontsize=7.4, color="#2f6db0", va="center")
+    arrow(ax, (45, 58), (45, 48), lw=1.2)
+    ax.text(46.5, 53, "首次发送 / 收到 INIT", fontsize=7.4, color="#2f6db0", va="center")
+    arrow(ax, (45, 36), (45, 26), lw=1.2)
+    ax.text(46.5, 31, "MAC 校验通过", fontsize=7.4, color="#2e8b57", va="center")
 
-    note(ax, 20, 62, "服务器侧：60 秒无活动\n→ 回收该 ID", 7.6, "#a86a12")
-    note(ax, 20, 14, "重连后会话必须重新握手：\n旧会话密钥已随 socket 一起丢弃\n（这正是前向保密的体现）", 7.8,
-         "#31414f")
+    arrow(ax, (58, 64), (70, 64), lw=1.2, color="#c0392b")
+    ax.text(64, 66.6, "socket 读失败", fontsize=7.2, color="#c0392b", ha="center")
+    arrow(ax, (58, 20), (70, 57), lw=1.2, color="#c0392b", rad=-0.12)
+    ax.text(66.5, 40, "心跳超时 /\n服务器关闭", fontsize=7.2, color="#c0392b", ha="center")
+
+    arrow(ax, (83, 70), (58, 86), lw=1.2, ls=(0, (4, 2)), color="#c0392b", rad=0.12)
+    ax.text(72, 82, "3 秒后自动重连", fontsize=7.2, color="#c0392b", ha="center")
+
+    note(ax, 2, 46, "服务器侧：60 秒无活动\n→ 回收该 ID", 7.4, "#a86a12", ha="left")
+    note(ax, 2, 26, "重连后必须重新握手：\n旧会话密钥随 socket 一起丢弃\n（这正是前向保密的体现）",
+         7.2, "#31414f", ha="left")
     save(fig, "fig_state.png")
 
 
@@ -450,16 +539,30 @@ def fig_storage():
     arrow(ax, (62, 37), (57, 37), lw=1.1, color="#c9861a")
 
     note(ax, 15, 40, "身份密钥\n是持久根", 7.8, "#2e8b57")
-    note(ax, 15, 20,
-         "为什么用“身份指纹”而不是服务器 ID 做目录名？\n"
-         "服务器 ID 是临时的（重启即变），身份密钥才是持久的；\n"
-         "这样重启、换 ID 之后，历史记录与指纹固定依然有效。", 7.8, "#31414f", style="italic")
+    note(ax, 2, 20, "为什么不按服务器 ID 归档？\nID 是临时的，身份密钥才是持久的；\n重启或换 ID 后历史与指纹固定仍有效",
+         7.4, "#31414f", ha="left", style="italic")
     box(ax, 62, 7, 32, 16, "换账户 / 换机器拷贝文件\nidentity.pem 无法解密\n历史记录一并失效",
         (("#f3f5f8"), "#8290a0"), 7.2)
     save(fig, "fig_storage.png")
 
 
 # ------------------------------------------------- 11. 中间人拓扑 ----------
+def _read_sas(path):
+    """读 mitm_demo 写出的两端安全码（c1/c2），没有就返回空串。"""
+    txt = ""
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
+            txt = f.read()
+    except OSError:
+        pass
+    out = []
+    for line in txt.splitlines():
+        if line.startswith(("c1=", "c2=")):
+            m = re.search(r"(\d{6})", line)
+            out.append(m.group(1) if m else "")
+    return out if len(out) == 2 else ["", ""]
+
+
 def fig_mitm():
     fig, ax = canvas(9.8, 5.6)
     box(ax, 2, 55, 24, 20, "用户 1\n（客户端 A）", BLUE, 9, bold=True)
@@ -468,11 +571,12 @@ def fig_mitm():
         RED, 9, bold=True)
     arrow(ax, (26, 68), (34, 68), color="#c0392b", lw=1.6, style="<|-|>")
     arrow(ax, (66, 68), (74, 68), color="#c0392b", lw=1.6, style="<|-|>")
-    note(ax, 30, 62, "会话①\nSAS=701991", 7.6, "#c0392b")
-    note(ax, 70, 62, "会话②\nSAS=584558", 7.6, "#c0392b")
+    note(ax, 30, 73, "会话①", 7.4, "#c0392b")
+    note(ax, 70, 73, "会话②", 7.4, "#c0392b")
 
-    box(ax, 2, 30, 24, 14, "状态栏：\n安全码 701991", (("#eef7f0"), "#2e8b57"), 8)
-    box(ax, 74, 30, 24, 14, "状态栏：\n安全码 584558", (("#eef7f0"), "#2e8b57"), 8)
+    s1, s2 = _read_sas(os.path.join(MITM, "sas.txt"))
+    box(ax, 2, 30, 24, 14, "状态栏：\n安全码 " + (s1 or "见正文"), (("#eef7f0"), "#2e8b57"), 7.4)
+    box(ax, 74, 30, 24, 14, "状态栏：\n安全码 " + (s2 or "见正文"), (("#eef7f0"), "#2e8b57"), 7.4)
     arrow(ax, (14, 55), (14, 44), lw=1.0, ls=(0, (3, 2)))
     arrow(ax, (86, 55), (86, 44), lw=1.0, ls=(0, (3, 2)))
 
