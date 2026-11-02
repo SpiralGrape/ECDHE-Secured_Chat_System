@@ -299,12 +299,13 @@ static bool HexToBytes(const std::wstring& hex, crypto::Bytes& out) {
 }
 
 // ============================================================ 身份密钥 IO ====
-static void SaveIdentity(EVP_PKEY* key, const std::wstring& path) {
+static bool SaveIdentity(EVP_PKEY* key, const std::wstring& path) {
     std::string pem = crypto::ed25519_to_pem(key);
-    if (pem.empty()) return;
+    if (pem.empty()) return false;
     std::string blob;
-    if (!DpapiProtect(pem, blob)) blob = pem;   // DPAPI 不可用时退回明文，保证可用性
-    WriteFileBytes(path, blob);
+    // 不静默降级：拿不到 DPAPI 就拒绝落盘，宁可启动失败也不要写明文私钥
+    if (!DpapiProtect(pem, blob)) return false;
+    return WriteFileBytes(path, blob);
 }
 
 static crypto::PkeyPtr LoadIdentity(const std::wstring& path) {
@@ -316,10 +317,13 @@ static crypto::PkeyPtr LoadIdentity(const std::wstring& path) {
             if (k) return k;
         }
         crypto::PkeyPtr k = crypto::ed25519_from_pem(raw);    // 兼容旧版明文 PEM
-        if (k) { SaveIdentity(k.get(), path); return k; }     // 自动升级为加密存储
+        if (k) {
+            if (!SaveIdentity(k.get(), path)) return nullptr; // 无法加密则不升级，也不继续使用
+            return k;
+        }
     }
     crypto::PkeyPtr k = crypto::ed25519_generate();
-    SaveIdentity(k.get(), path);
+    if (!SaveIdentity(k.get(), path)) return nullptr;
     return k;
 }
 
@@ -1261,7 +1265,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
         g_storageKey = crypto::hkdf(seed, crypto::Bytes{}, "CHAT-v1 local storage key", 32);
         crypto::wipe(seed);
     } catch (...) {
-        MessageBoxW(NULL, L"身份密钥初始化失败", L"错误", MB_ICONERROR);
+        MessageBoxW(NULL, L"身份密钥初始化失败。\n\n"
+                          L"程序要求身份私钥以 Windows DPAPI 加密后保存；若 DPAPI 不可用，"
+                          L"出于安全考虑不会退化为明文写入，因此无法继续运行。\n"
+                          L"请确认当前账户可以正常使用 DPAPI（例如已被正常加载的用户配置文件）。",
+                    L"错误", MB_ICONERROR);
         return 1;
     }
 
