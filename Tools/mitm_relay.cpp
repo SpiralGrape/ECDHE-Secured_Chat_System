@@ -290,6 +290,19 @@ static void HandleClient(ClientPtr c) {
 
         const int target = (int)proto::get_u32(buf.data());
         Bytes body(buf.begin() + 4, buf.end());
+
+        // 心跳帧（目标是服务器本身）：中间人冒充服务器回一条 PONG。
+        // 缺了这一步，客户端 15 秒收不到应答就会自己断开重连，号码一路往上涨。
+        if (target == proto::SERVER_ID) {
+            if (body.size() >= 2 && body[1] == proto::PING) {
+                Bytes pong;
+                pong.push_back(proto::VERSION);
+                pong.push_back(proto::PONG);
+                SendTo(c->id, proto::SERVER_ID, pong);
+            }
+            continue;
+        }
+
         Route(c->id, target, body);
     }
 

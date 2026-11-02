@@ -205,6 +205,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\mitm_demo.ps1
 
 > 测试结束后需关闭 `MitmRelay` 并重新启动 `Server_App`；若曾被中间人污染过 `pins` 目录，删除该目录即可重置信任。
 
+**演示控制台**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File Tools\demo.ps1
+```
+
+菜单驱动，逐步手动执行，便于现场演示：环境自检、编译、密码学自测、启动服务器与客户端、消息收发、安全码核对、本地密文取证、掉线重连、多用户并发（四人同时在线）与中间人攻击，每一步给出该步目的与可观察的结论，演示结束后可一键清理演示档案。
+
 ## 数据存储
 
 | 路径 | 内容 |
@@ -216,6 +224,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\mitm_demo.ps1
 归档目录用本地身份指纹而不是服务器分配的 ID：同一台机器换一个客户端档案，历史天然隔离。
 
 对端一侧用“对端指纹优先”的归档键：每条记录在密文里额外带一列对端身份指纹（`ts ‖ 方向 ‖ 对端指纹 ‖ 文本`，AAD 仍绑定对端 ID）。载入时按指纹把散在各 `<ID>.log` 里的记录合并成一个联系人并按时间排序，因此对方掉线重连、拿到新 ID 之后，旧记录不会与新的断开。握手完成前还不知道对方指纹的那几条记录先按 ID 暂存，握手拿到身份公钥后（TOFU 校验通过）立即并入指纹名下；解密时若发现记录长度不足或标签校验失败则跳过该条，不会张冠李戴。早期版本写入的三列记录（无指纹列）仍可读取，指纹由 `pins` 里的固定公钥反推。
+
+## 常见问题
+
+**为什么每次启动我的号码都不一样？**
+客户端 ID 由服务器按接入顺序分配，只用于路由，不代表身份。退出重开、断线重连都会拿到新号码。客户端在本地按对端身份指纹归并历史，所以号码变了历史也不会断，会话列表里的号码显示的是该联系人最近一次通信时的号码。
+
+**同时开两个客户端，为什么两边聊天记录一样？**
+两个实例用了同一个档案，也就是同一份身份密钥（同一个 `identity.pem`），因此共用同一份聊天记录目录。要模拟两个不同的人，必须用不同的 `--profile`：
+
+```powershell
+ClientGUI_App.exe --profile alice
+ClientGUI_App.exe --profile bob
+```
+
+**服务器关掉再开，历史还在吗？**
+在。聊天记录只保存在客户端本地，服务器不存储任何消息；只有“对方是否在线”会受影响。
+
+**换一台电脑还能解密历史吗？**
+不能。身份私钥由 Windows DPAPI 以当前用户为密钥加密，复制到其他机器或其他账户下都无法解开，聊天记录同样无法打开。
+
+**两个人能否在两台机器上通信？**
+可以。服务器监听全部网络接口（默认 9000 端口），客户端用 `--server <IP>` 指向服务器所在机器，并在防火墙放行 TCP 9000。
 
 ## 已知限制
 
@@ -243,7 +273,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\mitm_demo.ps1
 ├── Tools/
 │   ├── mitm_relay.cpp
 │   ├── mitm_demo.ps1
-│   └── smoke_test.ps1
+│   ├── smoke_test.ps1
+│   └── demo.ps1
 └── docs/
     ├── report.md
     ├── figures/

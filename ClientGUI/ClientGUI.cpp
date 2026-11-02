@@ -847,13 +847,16 @@ static void NetworkThread() {
         if (ec) throw std::runtime_error("读取客户端 ID 失败");
         my_client_id = (int)id;
 
+        // 先初始化心跳时间，再置“已连接”：否则定时器可能在这两步之间看到
+        // g_lastPong = 0，把刚建立的连接判成超时。
+        g_lastPong.store((long long)time(nullptr));
+        g_lastPing.store((long long)time(nullptr));
+
         {
             std::lock_guard<std::mutex> lk(g_net_mu);
             g_sock = sock;
             g_connected.store(true);
         }
-        g_lastPong.store((long long)time(nullptr));
-        g_lastPing.store((long long)time(nullptr));
 
         std::wstring title = L"ECDHE 前向保密聊天工具 - 用户 " + std::to_wstring(my_client_id);
         SetWindowTextW(hMainWnd, title.c_str());

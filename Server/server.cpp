@@ -33,9 +33,12 @@ struct ClientSession {
     int id;
     std::mutex write_mu;              // 保证同一 socket 上不会出现帧交错
     std::atomic<bool> alive{ true };
-    std::atomic<long long> lastActive{ 0 };   // 最后活动时间（用于心跳超时清理）
+    // 最后活动时间。必须在接入时就初始化，否则清理线程会把“刚连上还没发过帧”的
+    // 客户端当成 60 秒无活动直接踢掉。
+    std::atomic<long long> lastActive{ 0 };
 
-    ClientSession(tcp::socket&& s, int i) : sock(std::move(s)), id(i) {}
+    ClientSession(tcp::socket&& s, int i)
+        : sock(std::move(s)), id(i), lastActive{ (long long)time(nullptr) } {}
 };
 using SessionPtr = std::shared_ptr<ClientSession>;
 
@@ -202,7 +205,8 @@ int main() {
             {
                 std::lock_guard<std::mutex> lk(g_clients_mu);
                 for (const auto& kv : g_clients) {
-                    if (now - kv.second->lastActive.load() > 60) dead.push_back(kv.second);
+                    const long long last = kv.second->lastActive.load();
+                    if (last > 0 && now - last > 60) dead.push_back(kv.second);
                 }
             }
             for (const auto& c : dead) {
