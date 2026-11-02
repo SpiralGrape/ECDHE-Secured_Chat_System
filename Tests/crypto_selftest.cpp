@@ -1,6 +1,6 @@
 // ============================================================================
-//  密码学自测：验证 ECDHE 握手密钥调度、AEAD、签名与消息级棘轮
-//  运行方式：build\Debug\CryptoTest.exe
+//  密码学自测：密钥调度、AEAD、签名、两种棘轮
+//  运行：build\Debug\CryptoTest.exe
 // ============================================================================
 
 #include <cstdio>
@@ -27,7 +27,7 @@ static void Check(bool cond, const char* what) {
 // 与客户端完全一致的密钥调度
 static void Derive(const Bytes& z, const Bytes& nonceA, const Bytes& nonceB, bool initiator,
                    Bytes& send_chain, Bytes& recv_chain, Bytes& finished_key) {
-    // salt 固定为 nonceA || nonceB（A 为发起方），与角色无关
+    // salt 固定为 nonceA || nonceB（A 为发起方）
     Bytes salt = crypto::cat(nonceA, nonceB);
     Bytes secret = crypto::hkdf(z, salt, "CHAT-v1 ECDHE X25519", 32);
     Bytes c_i2r = crypto::hkdf(secret, Bytes{}, "chain initiator->responder", 32);
@@ -87,7 +87,7 @@ int main() {
         Check(z1 == z2, "双方计算出相同的共享秘密");
         Check(z1.size() == 32, "共享秘密长度为 32 字节");
 
-        // 第二次握手（模拟下一次会话）：共享秘密必须不同 → 前向保密
+        // 第二次握手：共享秘密必须不同
         auto a2 = crypto::x25519_generate();
         auto b2 = crypto::x25519_generate();
         Bytes p2 = crypto::x25519_public_raw(b2.get());
@@ -164,7 +164,7 @@ int main() {
         }
         Check(all_ok, "连续 8 条消息双方棘轮状态同步");
 
-        // 当前链密钥无法还原第 1 条消息的密钥 → 消息级前向保密
+        // 当前链密钥无法还原第 1 条消息的密钥
         Bytes nowKey = crypto::hkdf(sSend, Bytes{}, "message key", 32);
         Check(nowKey != oldKey, "当前链密钥无法恢复历史消息密钥");
     }

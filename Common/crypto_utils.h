@@ -1,17 +1,13 @@
 #pragma once
 // ============================================================================
-//  ECDHE 安全聊天系统 - 密码学原语封装 (OpenSSL 3.x / EVP)
+//  密码学原语封装 (OpenSSL 3.x / EVP)
 //
-//  设计说明：
-//   1. 密钥交换：X25519（椭圆曲线迪菲-赫尔曼临时密钥交换 ECDHE）
-//   2. 密钥派生：HKDF-SHA256（RFC 5869），用于会话密钥条件化与域分离
-//   3. 记录加密：AES-256-GCM（AEAD，带附加认证数据 AAD）
-//   4. 身份认证：Ed25519 数字签名（长期主密钥，只签名临时公钥）
+//  X25519  密钥交换
+//  HKDF-SHA256  密钥派生
+//  AES-256-GCM  记录加密
+//  Ed25519  身份签名
 //
-//  前向保密（PFS）的关键约束：
-//   * 会话密钥只由“临时”X25519 私钥派生；
-//   * 长期身份私钥仅用于签名，不参与会话密钥生成；
-//   * 临时私钥与中间秘密用后立即 OPENSSL_cleanse 清零并释放。
+//  会话密钥只由临时 X25519 私钥派生，长期身份私钥只用于签名。
 // ============================================================================
 
 #include <cstdint>
@@ -44,7 +40,7 @@ struct CipherCtxDeleter {
 using CipherCtxPtr = std::unique_ptr<EVP_CIPHER_CTX, CipherCtxDeleter>;
 
 // ------------------------------------------------------------ 工具函数 ------
-// 安全擦除：防止密钥残留在内存或交换文件中
+// 擦除密钥缓冲
 inline void wipe(Bytes& b) {
     if (!b.empty()) OPENSSL_cleanse(b.data(), b.size());
 }
@@ -73,7 +69,7 @@ inline uint64_t random_u64() {
 }
 
 // ============================================================ X25519 ========
-// 生成临时（ephemeral）X25519 密钥对。每次握手都必须重新调用。
+// 生成临时 X25519 密钥对
 inline PkeyPtr x25519_generate() {
     EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, nullptr);
     if (!ctx) throw std::runtime_error("x25519: 无法创建上下文");
@@ -85,7 +81,7 @@ inline PkeyPtr x25519_generate() {
     return PkeyPtr(pkey);
 }
 
-// 导出 32 字节原始公钥（可在网络上传输）
+// 导出原始公钥（32 字节）
 inline Bytes x25519_public_raw(EVP_PKEY* pkey) {
     size_t len = 0;
     if (EVP_PKEY_get_raw_public_key(pkey, nullptr, &len) <= 0)
@@ -97,7 +93,7 @@ inline Bytes x25519_public_raw(EVP_PKEY* pkey) {
     return out;
 }
 
-// 由 32 字节原始公钥还原 EVP_PKEY
+// 从原始公钥还原 EVP_PKEY
 inline PkeyPtr x25519_from_public_raw(const unsigned char* data, size_t len) {
     EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, data, len);
     if (!pkey) throw std::runtime_error("x25519: 公钥格式非法");
@@ -125,8 +121,7 @@ inline Bytes x25519_shared(EVP_PKEY* my_priv, EVP_PKEY* peer_pub) {
 }
 
 // ============================================================== HKDF ========
-// HKDF-SHA256 (extract-and-expand)。从同一共享秘密派生多把用途不同的密钥，
-// 实现密码学中的“域分离”(domain separation)。
+// HKDF-SHA256，从同一秘密派生多把用途不同的子密钥
 inline Bytes hkdf(const Bytes& ikm, const Bytes& salt, const std::string& info, size_t out_len) {
     static const unsigned char kZero = 0;
     const unsigned char* salt_ptr = salt.empty() ? &kZero : salt.data();
@@ -159,7 +154,7 @@ inline Bytes sha256(const Bytes& data) {
     return out;
 }
 
-// HMAC-SHA256（用于 Finished 校验，证明双方派生出相同的会话密钥）
+// HMAC-SHA256，用于 Finished 校验
 inline Bytes hmac_sha256(const Bytes& key, const Bytes& data) {
     Bytes out(32);
     unsigned int len = 0;
@@ -171,7 +166,7 @@ inline Bytes hmac_sha256(const Bytes& key, const Bytes& data) {
 }
 
 // ====================================================== AES-256-GCM ========
-// 加密：返回 密文 || Tag(16)。nonce 由密钥棘轮派生，绝不复用。
+// 加密：返回 密文 || Tag(16)
 inline Bytes aead_encrypt(const Bytes& key, const Bytes& nonce,
                           const std::string& plaintext, const Bytes& aad) {
     if (key.size() != 32) throw std::runtime_error("AES-256 需要 32 字节密钥");
@@ -184,7 +179,7 @@ inline Bytes aead_encrypt(const Bytes& key, const Bytes& nonce,
     bool ok = EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1;
     if (ok) ok = EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, (int)nonce.size(), nullptr) == 1;
     if (ok) ok = EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), nonce.data()) == 1;
-    // AAD：把帧头（会话号/序号/收发方）绑定进 Tag，中继服务器无法篡改
+    // AAD：帧头（会话号/序号/收发方）进 Tag
     if (ok && !aad.empty())
         ok = EVP_EncryptUpdate(ctx.get(), nullptr, &len, aad.data(), (int)aad.size()) == 1;
     if (ok && !plaintext.empty())
@@ -200,7 +195,7 @@ inline Bytes aead_encrypt(const Bytes& key, const Bytes& nonce,
     return out;
 }
 
-// 解密：in = 密文 || Tag(16)。返回 false 表示认证失败（被篡改或密钥错误）。
+// 解密：in = 密文 || Tag(16)，认证失败返回 false
 inline bool aead_decrypt(const Bytes& key, const Bytes& nonce,
                          const Bytes& in, const Bytes& aad, std::string& out) {
     if (key.size() != 32 || in.size() < 16) return false;
@@ -232,8 +227,7 @@ inline bool aead_decrypt(const Bytes& key, const Bytes& nonce,
 }
 
 // ============================================================ Ed25519 ======
-// 长期身份密钥（“主密钥”）：只签名临时公钥，永不参与会话密钥派生。
-// 因此即使主密钥泄露，历史会话密钥依然安全 —— 这就是前向保密。
+// 长期身份密钥，只用于签名，不参与会话密钥派生
 inline PkeyPtr ed25519_generate() {
     EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
     if (!ctx) throw std::runtime_error("ed25519: ctx");
@@ -255,7 +249,7 @@ inline Bytes ed25519_public_raw(EVP_PKEY* pkey) {
     return out;
 }
 
-// 导出 32 字节原始私钥（仅用于派生本地存储密钥，不得外传）
+// 导出原始私钥（32 字节），用于派生本地存储密钥
 inline Bytes ed25519_private_raw(EVP_PKEY* pkey) {
     size_t len = 0;
     if (EVP_PKEY_get_raw_private_key(pkey, nullptr, &len) <= 0)
@@ -267,7 +261,7 @@ inline Bytes ed25519_private_raw(EVP_PKEY* pkey) {
     return out;
 }
 
-// 内存版 PEM 编解码（配合 DPAPI 等外部保护机制使用）
+// 内存版 PEM 编解码
 inline std::string ed25519_to_pem(EVP_PKEY* pkey) {
     BIO* bio = BIO_new(BIO_s_mem());
     if (!bio) return std::string();
@@ -316,11 +310,8 @@ inline bool ed25519_verify(const Bytes& pub, const Bytes& msg, const Bytes& sig)
     return ok;
 }
 
-// 身份密钥持久化（PEM 格式），保证“长期主密钥”在重启后保持不变。
-// 说明：
-//   * 使用宽字符路径，支持中文用户名（如 C:\Users\张三）；
-//   * 使用内存 BIO + 自行读写文件，避免 OpenSSL 静态库在 Windows 上
-//     对 FILE* 接口要求 OPENSSL_Applink 的问题。
+// 身份密钥读写（PEM）。用宽字符路径支持中文用户名；
+// 用内存 BIO + 自己读文件，避开静态库下 PEM_*(FILE*) 要 AppLink 的问题。
 inline PkeyPtr ed25519_load_pem(const std::wstring& path) {
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return PkeyPtr(nullptr);

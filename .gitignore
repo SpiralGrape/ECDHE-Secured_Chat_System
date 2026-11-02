@@ -38,3 +38,4 @@ docs/两人分工与答辩材料.md
 # Python 缓存
 __pycache__/
 *.pyc
+*.zip

@@ -1,11 +1,8 @@
 // ============================================================================
-//  ECDHE 安全聊天系统 —— 中继服务器
+//  中继服务器
 //
-//  定位：不可信中继（Untrusted Relay）
-//   * 服务器只按目标 ID 转发密文帧，不持有任何会话密钥，无法解密聊天内容；
-//   * 握手消息（INIT/RESP/CONFIRM）同样原样转发，服务器无法伪造或篡改
-//     （双方用 Ed25519 签名 + Finished MAC 校验，篡改必然被发现）；
-//   * 服务器若被攻破，攻击者只能看到长度与收发关系，拿不到明文。
+//  按目标 ID 转发密文帧，不持有任何会话密钥，握手报文同样原样转发。
+//  被攻破时只能看到长度和收发关系，拿不到明文。
 // ============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -53,8 +50,8 @@ static void Log(const std::string& line) {
 }
 
 // -------------------------------------------------------------- 发送帧 ------
-// 必须在 write_mu 保护下完成“长度 + 载荷”两次写，否则多线程写同一 socket
-// 会导致 TCP 字节流被交叉，接收端无法还原帧边界。
+// 必须在 write_mu 保护下完成两次写，否则多线程写同一个 socket 会把字节流交叉，
+// 接收端无法还原帧边界。
 static bool SendFrame(ClientSession& c, const unsigned char* payload, uint32_t len) {
     std::lock_guard<std::mutex> lk(c.write_mu);
     if (!c.alive.load()) return false;
@@ -108,7 +105,7 @@ static void HandleClient(SessionPtr client) {
 
     std::vector<unsigned char> buf;
     while (client->alive.load()) {
-        // 2. 读帧长度（严格限制上限，防止 OOM / DoS）
+        // 2. 读帧长度，检查上限
         uint32_t len = 0;
         boost::asio::read(client->sock, boost::asio::buffer(&len, 4), ec);
         if (ec) break;
@@ -139,7 +136,7 @@ static void HandleClient(SessionPtr client) {
             continue;
         }
 
-        // 3. 查找目标（锁内只做查找，锁外做阻塞写，避免全局串行化）
+        // 3. 查目标：锁内只查找，写操作放锁外
         SessionPtr dst;
         {
             std::lock_guard<std::mutex> lk(g_clients_mu);
@@ -195,8 +192,7 @@ int main() {
 
     std::cout << "ECDHE 安全聊天中继已启动，监听 9000 端口（服务器无法解密聊天内容）\n";
 
-    // 心跳巡检：每 10 秒清理一次超过 60 秒无活动的连接，
-    // 避免进程崩溃/拔网线后客户端 ID 被永久占用
+    // 每 10 秒清理一次超过 60 秒无活动的连接
     std::thread([] {
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));

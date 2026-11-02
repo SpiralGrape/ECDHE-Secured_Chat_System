@@ -1,18 +1,11 @@
 #pragma once
 // ============================================================================
-//  SecureSession —— 可复用的 ECDHE 安全会话（握手 + 记录层）
+//  SecureSession —— ECDHE 安全会话：握手 + 记录层
 //
-//  被客户端（正常通信）与 MITM 演示工具（攻击方）共同使用：
-//  只要两边都按同一份代码实现协议，演示结果才有说服力。
-//
-//  协议要点（详见 protocol.h）：
-//    INIT/RESP/CONFIRM 三次握手，X25519 临时密钥 + Ed25519 身份签名
-//    HKDF-SHA256 派生双向链密钥，消息级棘轮
-//    AES-256-GCM 加密，AAD 绑定会话号/序号/收发方
-//
-//  安全码（SAS）：
-//    握手完成后，双方对 transcript 计算 6 位数字。若中间人插入了两段独立
-//    握手，两侧算出的安全码必然不同 —— 用户口头核对即可发现 MITM。
+//  客户端与中间人工具共用这份实现，两边协议行为一致。
+//  握手：INIT/RESP/CONFIRM，X25519 临时密钥 + Ed25519 身份签名
+//  记录：HKDF-SHA256 派生链密钥，AES-256-GCM 加密，AAD 绑定帧头
+//  安全码：由握手 transcript 派生 6 位数字，供双方核对
 // ============================================================================
 
 #include <cstdio>
@@ -63,11 +56,11 @@ public:
     bool HandleConfirm(const Bytes& in, std::string& err);
 
     // -------------------------------------------------------- 记录层 ------
-    // out 依次包含「可选的 REKEY 控制帧」与「DATA 帧」，调用方按序发送即可
+    // out 依次为可选的 REKEY 帧与 DATA 帧，调用方按序发送
     bool Seal(int myId, int peerId, const std::string& plain,
               std::vector<Bytes>& out, std::string& err);
 
-    // isControl = true 表示这是一帧 REKEY（已在本端完成棘轮轮换），无需展示给用户
+    // isControl：该帧是 REKEY，已在本端完成轮换，不展示给用户
     bool Open(int myId, int peerId, const Bytes& in,
               std::string& plain, bool& isControl, std::string& err);
 
@@ -80,16 +73,16 @@ private:
     void ComputeSas();
 
     // ---- DH 棘轮 ----
-    // 用当前链密钥加密一条记录（推进 send_chain_）
+    // 用当前链密钥加密一条记录，并推进 send_chain_
     bool BuildRecord(uint8_t type, const Bytes& plain, int myId, int peerId,
                      Bytes& out, std::string& err);
-    // 用 DH 输出更新根密钥，并重置双向链密钥
+    // 用 DH 输出更新根密钥，重置双向链密钥
     bool ApplyRatchet(const Bytes& dhOut, std::string& err);
 
     State    state_ = State::None;
     uint64_t sid_ = 0;
 
-    crypto::PkeyPtr eph_;                      // 临时私钥（派生后立即销毁）
+    crypto::PkeyPtr eph_;                      // 临时私钥
     Bytes my_pub_, my_nonce_, my_idpub_;
     Bytes peer_pub_, peer_nonce_, peer_idpub_;
 
@@ -103,8 +96,8 @@ private:
     static constexpr int REKEY_INTERVAL = 8;   // 每发送 8 条消息轮换一次 DH 密钥
 
     bool is_initiator_ = false;
-    crypto::Bytes root_key_;                   // 根密钥（每次轮换更新）
-    crypto::PkeyPtr dh_self_;                  // 本端当前棘轮私钥（旧钥轮换后立刻销毁）
+    crypto::Bytes root_key_;                   // 根密钥
+    crypto::PkeyPtr dh_self_;                  // 本端棘轮私钥
     crypto::Bytes dh_self_pub_;
     crypto::Bytes dh_peer_pub_;                // 对端当前棘轮公钥
     int send_since_rekey_ = 0;
@@ -317,9 +310,7 @@ inline bool SecureSession::Derive(bool initiator, std::string& err) {
         }
 
         // ---- 初始化 DH 棘轮 ----
-        // 必须在 secret 被擦除之前派生根密钥；
-        // 握手阶段的双向临时密钥作为“初始棘轮密钥”（对端公钥已知，
-        // 首次轮换后本端旧私钥即被销毁）。
+        // 根密钥必须在 secret 清零之前派生。握手用的临时密钥对直接作为初始棘轮密钥。
         root_key_         = crypto::hkdf(secret, Bytes{}, "root key", 32);
         is_initiator_     = initiator;
         dh_self_          = std::move(eph_);
@@ -389,7 +380,7 @@ inline bool SecureSession::BuildRecord(uint8_t type, const Bytes& plain, int myI
 // DH 棘轮：用 DH 输出更新根密钥，并重置双向链密钥
 inline bool SecureSession::ApplyRatchet(const Bytes& dhOut, std::string& err) {
     try {
-        // root' = HKDF(salt = root, ikm = DH) —— 根密钥与实际 DH 输出绑定
+        // root' = HKDF(salt = root, ikm = DH)，与本次 DH 输出绑定
         root_key_ = crypto::hkdf(dhOut, root_key_, "CHAT-v1 DH ratchet root", 32);
 
         Bytes c_i2r = crypto::hkdf(root_key_, Bytes{}, "ratchet chain initiator->responder", 32);
@@ -414,25 +405,25 @@ inline bool SecureSession::Seal(int myId, int peerId, const std::string& plain,
     if (state_ != State::Established) { err = "会话未建立"; return false; }
     out.clear();
 
-    // 周期性 DH 棘轮：每 REKEY_INTERVAL 条消息轮换一次本端密钥
+    // 每 REKEY_INTERVAL 条消息做一次 DH 轮换
     if (send_since_rekey_ >= REKEY_INTERVAL) {
         try {
             crypto::PkeyPtr fresh = crypto::x25519_generate();
             Bytes freshPub = crypto::x25519_public_raw(fresh.get());
 
-            // 1) 用【旧链】加密 REKEY 帧（对端先用旧链解密，再轮换）
+            // 1) REKEY 帧用旧链加密，对端先解密再轮换
             Bytes rekeyRecord;
             if (!BuildRecord(proto::REKEY, freshPub, myId, peerId, rekeyRecord, err)) return false;
             out.push_back(rekeyRecord);
 
-            // 2) Z = DH(新私钥, 对端当前棘轮公钥) → 更新根密钥与链
+            // 2) 用新私钥与对端棘轮公钥算 DH，更新根密钥与链
             crypto::PkeyPtr peer = crypto::x25519_from_public_raw(dh_peer_pub_.data(), dh_peer_pub_.size());
             Bytes z = crypto::x25519_shared(fresh.get(), peer.get());
             bool ok = ApplyRatchet(z, err);
             crypto::wipe(z);
             if (!ok) return false;
 
-            // 3) 轮换：旧私钥被覆盖，历史 DH 输出无法再计算（后向恢复）
+            // 3) 覆盖旧私钥
             dh_self_     = std::move(fresh);
             dh_self_pub_ = freshPub;
             send_since_rekey_ = 0;

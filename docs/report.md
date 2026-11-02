@@ -331,6 +331,8 @@ flowchart TB
 
 **为什么按"身份指纹"而不是"客户端 ID"归档**：服务器分配的 ID 是临时的（重启即变），身份密钥才是持久的。以身份指纹命名，才能保证换 ID 后历史与指纹仍然有效。
 
+**对端一侧的归档键同样用指纹**：每条记录的明文为 `ts ‖ 方向 ‖ 对端身份指纹 ‖ 文本`（AAD 仍为对端 ID，防拼接）。启动时把散在各 `<对端ID>.log` 里的记录按指纹合并成同一联系人并稳定排序，因此对方掉线重连拿到新 ID 也不会把历史拆开，ID 被回收给他人也不会串档；握手完成前尚不知指纹的记录先按 `id:<号码>` 暂存，TOFU 校验通过后由 UI 线程并入指纹键。旧版三列记录仍可读，指纹由 `pins` 里的固定公钥反推。
+
 **本地存储密钥**：`storage_key = HKDF(ed25519_raw_private, "", "CHAT-v1 local storage key", 32)`，与传输密钥完全独立（域分离）。若私钥被 DPAPI 保护，则聊天记录同时获得"换账户不可解密"的保障。
 
 ---
@@ -738,6 +740,9 @@ cmake --build build --config Debug
 build\Debug\Server_App.exe
 build\Debug\ClientGUI_App.exe --profile alice
 build\Debug\ClientGUI_App.exe --profile bob
+
+# 跨机器：客户端指定中继地址（服务器防火墙放行 TCP 9000）
+build\Debug\ClientGUI_App.exe --server 192.168.1.20
 
 # 测试
 build\Debug\CryptoTest.exe

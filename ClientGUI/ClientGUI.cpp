@@ -1,16 +1,8 @@
 // ============================================================================
-//  ECDHE 安全聊天系统 —— 客户端 (Win32 GUI)
+//  客户端 (Win32 GUI)
 //
-//  功能：
-//   * 与任意在线用户进行 ECDHE(X25519) 临时密钥交换，每次会话独立会话密钥
-//   * AES-256-GCM 端到端加密，服务器无法解密
-//   * Ed25519 身份签名 + Finished 校验，抵御中间人攻击
-//   * 消息级密钥棘轮（每条消息由链式 HKDF 派生新密钥，删除旧链密钥）
-//
-//  体验相关：
-//   * 左侧会话列表，聊天记录按对端用户分文件持久化，重启自动重载
-//   * 握手/连接/错误等提示统一显示在底部状态栏，不污染聊天记录
-//   * 断线自动重连
+//  ECDHE 握手 + AES-256-GCM 记录层，服务器无法解密。
+//  聊天记录按对端分文件加密保存，重启自动重载；提示信息只写到状态栏。
 // ============================================================================
 
 #include <algorithm>
@@ -52,6 +44,7 @@ using crypto::Bytes;
 // ============================================================== 常量/消息 ====
 #define WM_CHAT_EVENT   (WM_APP + 1)   // lParam = new ChatEvent
 #define WM_SET_STATUS   (WM_APP + 2)   // wParam = 是否错误, lParam = new std::wstring
+#define WM_PEER_ID      (WM_APP + 3)   // lParam = new std::pair<int, std::wstring>
 
 #define IDC_SEND          1
 #define IDC_SESSION_LIST  101
@@ -76,8 +69,9 @@ std::atomic<bool>                         g_connecting(false);
 std::atomic<long long>                    g_lastPong(0);      // 最后一次收到 PONG 的时间
 std::atomic<long long>                    g_lastPing(0);
 int                                       my_client_id = 0;
+std::wstring                              g_serverHost = L"127.0.0.1";   // --server <ip>，默认本机
 
-// 单条消息上限（远小于协议帧上限，旧版无此校验会导致发长文直接断连）
+// 单条消息上限，小于协议帧上限
 constexpr size_t MAX_TEXT_BYTES = 64 * 1024;
 
 // 身份（长期主密钥）
@@ -102,9 +96,36 @@ struct ChatMsg {
     int          dir = 0;   // 0=收到 1=发出
     std::wstring text;
 };
-std::map<int, std::vector<ChatMsg>> g_chats;
-std::set<int>  g_unread;
-int            g_activePeer = 0;            // 0 表示无选中会话
+
+// 联系人标识：拿到对端身份指纹后用 "fp:<8hex>"，否则退回 "id:<服务器ID>"。
+// 这样对方换号不会把历史拆开，号码被别人复用也不会混在一起。
+using ContactKey = std::wstring;
+
+std::map<ContactKey, std::vector<ChatMsg>> g_chats;
+std::set<ContactKey>      g_unread;
+ContactKey                g_activeKey;        // 空表示无选中会话
+std::vector<ContactKey>   g_listKeys;         // 列表项索引 -> 联系人
+std::map<int, ContactKey> g_idKey;            // 服务器 ID -> 联系人（握手后建立）
+std::map<ContactKey, int> g_keyId;            // 联系人 -> 最近一次已知 ID
+
+static ContactKey KeyOfId(int id) { return L"id:" + std::to_wstring(id); }
+static ContactKey KeyOfFp(const std::wstring& fp) { return L"fp:" + fp; }
+
+static std::wstring FpOfKey(const ContactKey& k) {
+    return k.rfind(L"fp:", 0) == 0 ? k.substr(3) : std::wstring();
+}
+
+static int IdOfKey(const ContactKey& k) {
+    auto it = g_keyId.find(k);
+    if (it != g_keyId.end()) return it->second;
+    if (k.rfind(L"id:", 0) == 0) return _wtoi(k.c_str() + 3);
+    return 0;
+}
+
+static ContactKey KeyForId(int id) {
+    auto it = g_idKey.find(id);
+    return (it != g_idKey.end()) ? it->second : KeyOfId(id);
+}
 
 // 网络线程 → UI 线程的消息
 struct ChatEvent {
@@ -157,7 +178,7 @@ static std::wstring AppDir() {
     return dir;
 }
 
-// 历史记录按“本地身份指纹”归档：服务器分配的 ID 是临时的，身份是持久的
+// 历史记录按本地身份指纹归档（服务器 ID 是临时的）
 static std::wstring ChatsDir() {
     std::wstring dir = AppDir() + L"\\chats";
     if (!g_my_fingerprint.empty()) dir += L"\\" + g_my_fingerprint;
@@ -226,7 +247,7 @@ static bool WriteFileBytes(const std::wstring& path, const std::string& data) {
 }
 
 // --------------------------------------------------- DPAPI 私钥保护 --------
-// 用当前 Windows 用户凭据加密身份私钥：文件被拷到其他账户/机器上也无法解密
+// 用当前 Windows 用户凭据加密身份私钥
 static bool DpapiProtect(const std::string& in, std::string& out) {
     DATA_BLOB din { (DWORD)in.size(), (BYTE*)in.data() };
     DATA_BLOB dout { 0, nullptr };
@@ -307,10 +328,11 @@ static std::wstring ChatFile(int peer) {
     return ChatsDir() + L"\\" + std::to_wstring(peer) + L".log";
 }
 
-static void SaveChatMsg(int peer, const ChatMsg& m) {
+static void SaveChatMsg(int peer, const ContactKey& key, const ChatMsg& m) {
     if (g_storageKey.size() != 32) return;
 
-    std::wstring plain = std::to_wstring(m.ts) + L"\t" + std::to_wstring(m.dir) + L"\t" + Esc(m.text);
+    std::wstring plain = std::to_wstring(m.ts) + L"\t" + std::to_wstring(m.dir) + L"\t" +
+                         FpOfKey(key) + L"\t" + Esc(m.text);
     std::string plainU8 = WideToUtf8(plain);
 
     crypto::Bytes aad;
@@ -337,11 +359,14 @@ static void SaveChatMsg(int peer, const ChatMsg& m) {
 static void LoadAllChats() {
     g_chats.clear();
     g_unread.clear();
-    g_activePeer = 0;
+    g_activeKey.clear();
 
     std::error_code ec;
     std::filesystem::path dir(ChatsDir());
     if (!std::filesystem::exists(dir, ec)) return;
+
+    // 每个联系人最近一条记录的时间与那时的对端 ID，用来决定列表上显示哪个号码
+    std::map<ContactKey, std::pair<uint64_t, int>> latest;
 
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
         if (!entry.is_regular_file()) continue;
@@ -387,14 +412,36 @@ static void LoadAllChats() {
             if (t1 == std::wstring::npos) continue;
             size_t t2 = plain.find(L'\t', t1 + 1);
             if (t2 == std::wstring::npos) continue;
+            size_t t3 = plain.find(L'\t', t2 + 1);
 
             ChatMsg m;
-            m.ts   = _wcstoui64(plain.substr(0, t1).c_str(), nullptr, 10);
-            m.dir  = _wtoi(plain.substr(t1 + 1, t2 - t1 - 1).c_str());
-            m.text = Unesc(plain.substr(t2 + 1));
-            g_chats[peer].push_back(m);
+            m.ts  = _wcstoui64(plain.substr(0, t1).c_str(), nullptr, 10);
+            m.dir = _wtoi(plain.substr(t1 + 1, t2 - t1 - 1).c_str());
+
+            std::wstring fp;
+            if (t3 != std::wstring::npos) {          // 新格式：ts | dir | 对端指纹 | 文本
+                fp     = plain.substr(t2 + 1, t3 - t2 - 1);
+                m.text = Unesc(plain.substr(t3 + 1));
+            } else {                                  // 旧格式：没有指纹列
+                m.text = Unesc(plain.substr(t2 + 1));
+            }
+
+            ContactKey key = fp.empty() ? KeyForId(peer) : KeyOfFp(fp);
+            if (!fp.empty()) g_idKey[peer] = key;
+            g_keyId[key] = peer;
+            g_chats[key].push_back(m);
+
+            auto it = latest.find(key);
+            if (it == latest.end() || m.ts > it->second.first) latest[key] = { m.ts, peer };
         }
     }
+
+    // 同一个联系人的记录可能散在多个 <id>.log 里，合并后按时间排一下
+    for (auto& kv : g_chats) {
+        std::stable_sort(kv.second.begin(), kv.second.end(),
+                         [](const ChatMsg& a, const ChatMsg& b) { return a.ts < b.ts; });
+    }
+    for (const auto& kv : latest) g_keyId[kv.first] = kv.second.second;
 }
 
 // ========================================================== 指纹固定 IO ====
@@ -464,20 +511,26 @@ static void LoadPins() {
 static void RefreshSessionList() {
     if (!hSessionList) return;
     SendMessageW(hSessionList, LB_RESETCONTENT, 0, 0);
+    g_listKeys.clear();
 
     for (const auto& kv : g_chats) {
-        const int peer = kv.first;
+        const ContactKey& key = kv.first;
+        int peer = IdOfKey(key);
         std::wstring label = L"用户 " + std::to_wstring(peer);
-        if (g_unread.count(peer)) label += L"  ●";
+        if (g_unread.count(key)) label += L"  ●";
         int idx = (int)SendMessageW(hSessionList, LB_ADDSTRING, 0, (LPARAM)label.c_str());
-        if (idx >= 0) SendMessageW(hSessionList, LB_SETITEMDATA, idx, (LPARAM)peer);
+        if (idx >= 0) {
+            g_listKeys.push_back(key);
+            SendMessageW(hSessionList, LB_SETITEMDATA, idx, (LPARAM)(g_listKeys.size() - 1));
+        }
     }
 
     // 保持当前选中项
-    if (g_activePeer > 0) {
+    if (!g_activeKey.empty()) {
         int count = (int)SendMessageW(hSessionList, LB_GETCOUNT, 0, 0);
         for (int i = 0; i < count; ++i) {
-            if (SendMessageW(hSessionList, LB_GETITEMDATA, i, 0) == (LPARAM)g_activePeer) {
+            int slot = (int)SendMessageW(hSessionList, LB_GETITEMDATA, i, 0);
+            if (slot >= 0 && slot < (int)g_listKeys.size() && g_listKeys[slot] == g_activeKey) {
                 SendMessageW(hSessionList, LB_SETCURSEL, i, 0);
                 break;
             }
@@ -498,9 +551,10 @@ static void RefreshChatView() {
     if (!hChatBox) return;
 
     std::wstring all;
-    auto it = g_chats.find(g_activePeer);
+    auto it = g_chats.find(g_activeKey);
     if (it != g_chats.end()) {
-        for (const auto& m : it->second) all += RenderLine(g_activePeer, m);
+        const int peer = IdOfKey(it->first);
+        for (const auto& m : it->second) all += RenderLine(peer, m);
     }
     SetWindowTextW(hChatBox, all.c_str());
     SendMessageW(hChatBox, EM_SETSEL, (WPARAM)all.size(), (LPARAM)all.size());
@@ -523,13 +577,15 @@ static void ApplyChatEvent(int peer, int dir, const std::wstring& text) {
     m.dir  = dir;
     m.text = text;
 
-    g_chats[peer].push_back(m);
-    SaveChatMsg(peer, m);
+    ContactKey key = KeyForId(peer);
+    g_chats[key].push_back(m);
+    g_keyId[key] = peer;
+    SaveChatMsg(peer, key, m);
 
-    if (peer == g_activePeer) {
+    if (key == g_activeKey) {
         AppendChatView(RenderLine(peer, m));
     } else if (dir == 0) {
-        g_unread.insert(peer);
+        g_unread.insert(key);
     }
 
     int listCount = (int)SendMessageW(hSessionList, LB_GETCOUNT, 0, 0);
@@ -545,6 +601,36 @@ static void PostChat(int peer, int dir, const std::wstring& text) {
 static void PostStatus(const std::wstring& text, bool error = false) {
     if (!hMainWnd) return;
     PostMessageW(hMainWnd, WM_SET_STATUS, (WPARAM)(error ? 1 : 0), (LPARAM)new std::wstring(text));
+}
+
+// 握手后知道了对端身份公钥，把它对应的指纹告诉 UI 线程
+static void PostPeerId(int peer, const crypto::Bytes& idpub) {
+    if (!hMainWnd || idpub.empty()) return;
+    std::wstring fp = HexW(crypto::sha256(idpub), 8);
+    PostMessageW(hMainWnd, WM_PEER_ID, 0,
+                 (LPARAM)new std::pair<int, std::wstring>(peer, fp));
+}
+
+// 登记 "服务器 ID -> 对端指纹"，并把之前按 ID 归的临时记录并到指纹名下（UI 线程）
+static void RegisterPeerIdentity(int peer, const std::wstring& fp) {
+    if (peer <= 0 || fp.empty()) return;
+
+    ContactKey nk  = KeyOfFp(fp);
+    ContactKey old = KeyForId(peer);
+    g_idKey[peer] = nk;
+    g_keyId[nk]   = peer;
+    if (old == nk) return;
+
+    auto it = g_chats.find(old);
+    if (it != g_chats.end()) {
+        auto& dst = g_chats[nk];
+        dst.insert(dst.end(), it->second.begin(), it->second.end());
+        g_chats.erase(it);
+        std::stable_sort(dst.begin(), dst.end(),
+                         [](const ChatMsg& a, const ChatMsg& b) { return a.ts < b.ts; });
+    }
+    if (g_unread.erase(old)) g_unread.insert(nk);
+    if (g_activeKey == old) g_activeKey = nk;
 }
 
 // ============================================================ 链路收发 ====
@@ -605,7 +691,7 @@ static void LockedStartHandshake(int peer) {
     PostStatus(L"正在与用户 " + std::to_wstring(peer) + L" 协商 ECDHE 会话…");
 }
 
-// 身份公钥固定（TOFU）：首次见面即记录，之后变化即视为中间人
+// TOFU：首次记录对端身份公钥，之后变化即视为异常
 static bool CheckPin(int peer, const crypto::Bytes& idpub) {
     auto it = g_pins.find(peer);
     if (it == g_pins.end()) {
@@ -654,6 +740,7 @@ static void HandleInit(int sender, const Bytes& body) {
         g_sessions.erase(sender);
         return;
     }
+    PostPeerId(sender, ps.crypto.peerIdentity());
 
     SendRaw(MakeFrame(sender, resp));
     PostStatus(L"正在与用户 " + std::to_wstring(sender) + L" 协商 ECDHE 会话…");
@@ -677,6 +764,7 @@ static void HandleResp(int sender, const Bytes& body) {
         g_sessions.erase(it);
         return;
     }
+    PostPeerId(sender, ps.crypto.peerIdentity());
 
     SendRaw(MakeFrame(sender, confirm));
     PostEstablished(sender, ps.crypto);
@@ -751,7 +839,7 @@ static void NetworkThread() {
     try {
         g_io = std::make_shared<boost::asio::io_context>();
         auto sock = std::make_shared<tcp::socket>(*g_io);
-        sock->connect(tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 9000));
+        sock->connect(tcp::endpoint(boost::asio::ip::make_address(WideToUtf8(g_serverHost)), 9000));
 
         boost::system::error_code ec;
         uint32_t id = 0;
@@ -823,7 +911,7 @@ static void NetworkThread() {
 
     SetWindowTextW(hMainWnd, L"ECDHE 前向保密聊天工具");
     if (my_client_id == 0)
-        PostStatus(L"无法连接服务器（127.0.0.1:9000），正在重试…", true);
+        PostStatus(L"无法连接服务器（" + g_serverHost + L":9000），正在重试…", true);
     else
         PostStatus(L"与服务器断开，正在重试连接…", true);
 
@@ -881,11 +969,15 @@ static void LayoutControls(int w, int h) {
 static void OnSessionChanged() {
     int sel = (int)SendMessageW(hSessionList, LB_GETCURSEL, 0, 0);
     if (sel < 0) return;
-    int peer = (int)SendMessageW(hSessionList, LB_GETITEMDATA, sel, 0);
+    int slot = (int)SendMessageW(hSessionList, LB_GETITEMDATA, sel, 0);
+    if (slot < 0 || slot >= (int)g_listKeys.size()) return;
+
+    ContactKey key = g_listKeys[slot];
+    int peer = IdOfKey(key);
     if (peer <= 0) return;
 
-    g_activePeer = peer;
-    g_unread.erase(peer);
+    g_activeKey = key;
+    g_unread.erase(key);
     SetWindowTextW(hTargetBox, std::to_wstring(peer).c_str());
     RefreshChatView();
     RefreshSessionList();
@@ -930,7 +1022,7 @@ static void OnSendClicked() {
     if (!SendUserMessage(target, text, queued)) return;    // 过长/为空时已提示，不做本地回显
 
     // 本地回显 + 落盘
-    g_activePeer = target;
+    g_activeKey = KeyForId(target);
     SetWindowTextW(hInputBox, L"");
     ApplyChatEvent(target, 1, text);
 }
@@ -1058,6 +1150,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    case WM_PEER_ID:
+    {
+        auto* p = (std::pair<int, std::wstring>*)lParam;
+        if (p) {
+            RegisterPeerIdentity(p->first, p->second);
+            delete p;
+            RefreshSessionList();
+            RefreshChatView();
+        }
+        return 0;
+    }
+
     case WM_SET_STATUS:
     {
         std::wstring* text = (std::wstring*)lParam;
@@ -1075,7 +1179,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             if (g_connected.load()) {
                 const long long now = (long long)time(nullptr);
 
-                // 心跳超时：15 秒未收到 PONG 就判定断线，主动关闭 socket 触发重连
+                // 超过 15 秒没收到 PONG 就判定断线
                 if (now - g_lastPong.load() > 15) {
                     PostStatus(L"连接已超时，正在重连…", true);
                     {
@@ -1132,6 +1236,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 
         std::string dump = takeArg("--dump");
         if (!dump.empty()) g_dumpPath = Utf8ToWide(dump);
+
+        std::string server = takeArg("--server");
+        if (!server.empty()) g_serverHost = Utf8ToWide(server);
     }
 
     HDC screen = GetDC(NULL);
@@ -1146,7 +1253,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
         if (!g_identity) throw std::runtime_error("identity");
         g_my_fingerprint = HexW(crypto::sha256(crypto::ed25519_public_raw(g_identity.get())), 8);
 
-        // 本地聊天记录的加密密钥：由身份私钥经 HKDF 派生（域分离），私钥不落盘于明文中
+        // 存储密钥：由身份私钥经 HKDF 派生
         crypto::Bytes seed = crypto::ed25519_private_raw(g_identity.get());
         g_storageKey = crypto::hkdf(seed, crypto::Bytes{}, "CHAT-v1 local storage key", 32);
         crypto::wipe(seed);
@@ -1155,19 +1262,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
         return 1;
     }
 
-    // 载入历史聊天记录与已固定的身份指纹（按本地身份指纹归档，不随服务器 ID 变化）
-    LoadAllChats();
+    // 先载入指纹固定表，旧记录才能在载入时把服务器 ID 解成对端身份
     {
         std::lock_guard<std::mutex> lk(g_sess_mu);
         LoadPins();
+        g_idKey.clear();
+        g_keyId.clear();
+        for (const auto& kv : g_pins) {
+            ContactKey k = KeyOfFp(HexW(crypto::sha256(kv.second), 8));
+            g_idKey[kv.first] = k;
+            g_keyId[k]        = kv.first;
+        }
     }
+    LoadAllChats();
 
     // --dump <文件>：导出已解密的聊天记录后退出（用于备份/自动化测试）
     if (!g_dumpPath.empty()) {
         std::wstring out;
         for (const auto& kv : g_chats) {
+            std::wstring id = std::to_wstring(IdOfKey(kv.first));
             for (const auto& m : kv.second) {
-                out += std::to_wstring(kv.first) + L"\t" + std::to_wstring(m.dir) + L"\t" + m.text + L"\n";
+                out += id + L"\t" + std::to_wstring(m.dir) + L"\t" + m.text + L"\n";
             }
         }
         WriteFileBytes(g_dumpPath, WideToUtf8(out));
@@ -1192,17 +1307,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 
     // 自动选中最近一次会话，打开即可看到上次的聊天记录
     {
-        int best = 0;
+        ContactKey best;
         uint64_t bestTs = 0;
         for (const auto& kv : g_chats) {
             if (!kv.second.empty() && kv.second.back().ts >= bestTs) {
                 bestTs = kv.second.back().ts;
-                best = kv.first;
+                best   = kv.first;
             }
         }
-        if (best > 0) {
-            g_activePeer = best;
-            SetWindowTextW(hTargetBox, std::to_wstring(best).c_str());
+        if (!best.empty()) {
+            g_activeKey = best;
+            SetWindowTextW(hTargetBox, std::to_wstring(IdOfKey(best)).c_str());
         }
     }
     RefreshSessionList();
